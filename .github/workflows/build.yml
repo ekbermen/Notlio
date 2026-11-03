@@ -17,6 +17,7 @@
 #   common.dart  emoji/sticker setleri, renkler, kâğıt desenleri, not kartı
 #   editor.dart  öğrenci not editörü + çizim sayfası
 #   code.dart    yazılımcı editörü (renklendirme, satır no, ▶ çalıştır)
+#   logo.dart    Notlio logosu (kodla çizilir)
 #   ui.dart      ana ekran, defterler, arama, ayarlar, çöp kutusu, kilit
 #   main.dart    giriş noktası ve tema
 #
@@ -42,30 +43,31 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Depoyu al
+      - name: "Depoyu al"
         uses: actions/checkout@v4
 
-      - name: Java 17
+      - name: "Java 17"
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Flutter kur
+      - name: "Flutter kur"
         uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.24.5'
           channel: stable
           cache: true
 
-      - name: Flutter projesini oluştur
+      - name: "Flutter projesini oluştur"
         run: |
           flutter --version
           flutter create --org com.notlio --project-name notlio --platforms android --description "Notlio - Not x Land" app
           rm -rf app/test
           rm -f app/lib/main.dart
+          rm -f app/analysis_options.yaml
 
-      - name: pubspec.yaml
+      - name: "pubspec.yaml"
         working-directory: app
         run: |
           cat > pubspec.yaml << 'NOTLIOEOF'
@@ -96,7 +98,7 @@ jobs:
             uses-material-design: true
           NOTLIOEOF
 
-      - name: Android ayarları (izinler, SDK, ad)
+      - name: "Android ayarları (izinler, SDK, ad)"
         working-directory: app
         run: |
           python3 - << 'NOTLIOEOF'
@@ -130,13 +132,101 @@ jobs:
               t = re.sub(r'minSdk(Version)?\s*=?\s*flutter\.minSdkVersion', 'minSdk = 24', t)
               open(g, 'w', encoding='utf-8').write(t)
 
+          for g in glob.glob('android/settings.gradle*') + glob.glob('android/build.gradle*'):
+              t = open(g, encoding='utf-8').read()
+              t2 = re.sub(r'(org\.jetbrains\.kotlin\.android"?\s*\)?\s*version\s*"?)1\.[78]\.\d+', r'\g<1>1.9.24', t)
+              t2 = re.sub(r"(ext\.kotlin_version\s*=\s*')1\.[78]\.\d+", r'\g<1>1.9.24', t2)
+              if t2 != t:
+                  open(g, 'w', encoding='utf-8').write(t2)
+                  print('Kotlin guncellendi:', g)
+
           with open('android/gradle.properties', 'a', encoding='utf-8') as f:
               f.write('\nandroid.suppressUnsupportedCompileSdk=35\n')
               f.write('org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G\n')
           print(open(mf, encoding='utf-8').read())
           NOTLIOEOF
 
-      - name: lib/models.dart  (veri modeli, saklama, şifreleme)
+      - name: "Logo ve uygulama ikonu (kodla uretilir)"
+        working-directory: app
+        run: |
+          pip install pillow
+          python3 - << 'NOTLIOEOF'
+          import os
+          from PIL import Image, ImageDraw
+
+          S = 1024
+          VIOLET = (108, 92, 231)
+          PINK = (253, 121, 168)
+
+          def gradient(size):
+              img = Image.new('RGB', (size, size))
+              px = img.load()
+              for y in range(size):
+                  for x in range(size):
+                      t = (x + y) / (2.0 * (size - 1))
+                      px[x, y] = tuple(int(VIOLET[i] + (PINK[i] - VIOLET[i]) * t) for i in range(3))
+              return img.convert('RGBA')
+
+          def star(d, cx, cy, r, fill):
+              k = r * 0.22
+              d.polygon([(cx, cy - r), (cx + k, cy - k), (cx + r, cy), (cx + k, cy + k),
+                         (cx, cy + r), (cx - k, cy + k), (cx - r, cy), (cx - k, cy - k)], fill=fill)
+
+          def foreground():
+              # transparent layer, logo inside the adaptive-icon safe zone
+              img = Image.new('RGBA', (S, S), (0, 0, 0, 0))
+              d = ImageDraw.Draw(img)
+              x0, y0, x1, y1 = 300, 250, 724, 774
+              fold = 120
+              page = (255, 255, 255, 255)
+              d.polygon([(x0, y0), (x1 - fold, y0), (x1, y0 + fold), (x1, y1), (x0, y1)], fill=page)
+              d.polygon([(x1 - fold, y0), (x1, y0 + fold), (x1 - fold, y0 + fold)], fill=(215, 208, 250, 255))
+              line = (160, 150, 235, 255)
+              for i, (ya, w) in enumerate([(430, 300), (510, 300), (590, 200)]):
+                  d.rounded_rectangle([x0 + 50, ya, x0 + 50 + w - 100 + 100, ya + 30], radius=15, fill=line)
+              star(d, x1 - 20, y1 - 30, 105, (253, 203, 110, 255))
+              star(d, x1 + 90, y1 - 150, 44, (255, 255, 255, 255))
+              return img
+
+          def make(size, img):
+              return img.resize((size, size), Image.LANCZOS)
+
+          bg = gradient(S)
+          fg = foreground()
+          full = bg.copy()
+          full.alpha_composite(fg)
+
+          # legacy rounded icon
+          mask = Image.new('L', (S, S), 0)
+          ImageDraw.Draw(mask).rounded_rectangle([0, 0, S - 1, S - 1], radius=int(S * 0.22), fill=255)
+          legacy = Image.new('RGBA', (S, S), (0, 0, 0, 0))
+          legacy.paste(full, (0, 0), mask)
+
+          legacy_sizes = {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}
+          adaptive_sizes = {'mdpi': 108, 'hdpi': 162, 'xhdpi': 216, 'xxhdpi': 324, 'xxxhdpi': 432}
+          res = 'android/app/src/main/res'
+          for dens, sz in legacy_sizes.items():
+              folder = f'{res}/mipmap-{dens}'
+              os.makedirs(folder, exist_ok=True)
+              make(sz, legacy).save(f'{folder}/ic_launcher.png')
+              make(sz, legacy).save(f'{folder}/ic_launcher_round.png')
+          for dens, sz in adaptive_sizes.items():
+              folder = f'{res}/mipmap-{dens}'
+              make(sz, fg).save(f'{folder}/ic_launcher_foreground.png')
+              make(sz, bg).save(f'{folder}/ic_launcher_background.png')
+
+          os.makedirs(f'{res}/mipmap-anydpi-v26', exist_ok=True)
+          xml = ('<?xml version="1.0" encoding="utf-8"?>\n'
+                 '<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">\n'
+                 '    <background android:drawable="@mipmap/ic_launcher_background"/>\n'
+                 '    <foreground android:drawable="@mipmap/ic_launcher_foreground"/>\n'
+                 '</adaptive-icon>\n')
+          open(f'{res}/mipmap-anydpi-v26/ic_launcher.xml', 'w').write(xml)
+          open(f'{res}/mipmap-anydpi-v26/ic_launcher_round.xml', 'w').write(xml)
+          print('Ikon dosyalari hazir')
+          NOTLIOEOF
+
+      - name: "lib/models.dart (veri modeli, saklama, şifreleme)"
         working-directory: app
         run: |
           cat > lib/models.dart << 'NOTLIOEOF'
@@ -333,7 +423,7 @@ jobs:
             enc.Key _key(String p) => enc.Key(Uint8List.fromList(sha256.convert(utf8.encode('notlio-aes::$p')).bytes));
 
             String _encrypt(String plain, String p) {
-              final iv = enc.IV.fromLength(16);
+              final iv = enc.IV.fromSecureRandom(16);
               final e = enc.Encrypter(enc.AES(_key(p), mode: enc.AESMode.cbc));
               final out = e.encrypt(plain, iv: iv);
               return 'NLE1:${iv.base64}:${out.base64}';
@@ -441,6 +531,7 @@ jobs:
             }
 
             Future<void> saveNow() async {
+              if (locked) return;
               try {
                 var s = jsonEncode(_toMap());
                 if (encrypted && _pass != null) s = _encrypt(s, _pass!);
@@ -624,7 +715,7 @@ jobs:
           }
           NOTLIOEOF
 
-      - name: lib/runner.dart  (kod çalıştırma motoru)
+      - name: "lib/runner.dart (kod çalıştırma motoru)"
         working-directory: app
         run: |
           cat > lib/runner.dart << 'NOTLIOEOF'
@@ -831,7 +922,7 @@ jobs:
           }
           NOTLIOEOF
 
-      - name: lib/ai.dart  (yapay zeka: analiz, model seçimi, panel)
+      - name: "lib/ai.dart (yapay zeka, analiz, model secimi, panel)"
         working-directory: app
         run: |
           cat > lib/ai.dart << 'NOTLIOEOF'
@@ -1518,7 +1609,7 @@ jobs:
           }
           NOTLIOEOF
 
-      - name: lib/common.dart  (ortak parçalar, emoji, sticker, kâğıt)
+      - name: "lib/common.dart (ortak parçalar, emoji, sticker, kâğıt)"
         working-directory: app
         run: |
           cat > lib/common.dart << 'NOTLIOEOF'
@@ -1760,7 +1851,7 @@ jobs:
           }
           NOTLIOEOF
 
-      - name: lib/editor.dart  (öğrenci editörü + çizim)
+      - name: "lib/editor.dart (öğrenci editörü + çizim)"
         working-directory: app
         run: |
           cat > lib/editor.dart << 'NOTLIOEOF'
@@ -2560,7 +2651,7 @@ jobs:
           }
           NOTLIOEOF
 
-      - name: lib/code.dart  (yazılımcı editörü)
+      - name: "lib/code.dart (yazılımcı editörü)"
         working-directory: app
         run: |
           cat > lib/code.dart << 'NOTLIOEOF'
@@ -3011,7 +3102,88 @@ jobs:
           }
           NOTLIOEOF
 
-      - name: lib/ui.dart  (ekranlar)
+      - name: "lib/logo.dart (Notlio logosu, kodla cizilir)"
+        working-directory: app
+        run: |
+          cat > lib/logo.dart << 'NOTLIOEOF'
+          import 'package:flutter/material.dart';
+
+          class _LogoPainter extends CustomPainter {
+            @override
+            void paint(Canvas canvas, Size size) {
+              final u = size.width / 1024.0;
+
+              // gradient rounded background
+              final rect = Rect.fromLTWH(0, 0, size.width, size.height);
+              final bg = Paint()
+                ..shader = const LinearGradient(
+                  colors: [Color(0xFF6C5CE7), Color(0xFFFD79A8)],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ).createShader(rect);
+              canvas.drawRRect(RRect.fromRectAndRadius(rect, Radius.circular(size.width * 0.22)), bg);
+
+              // page with folded corner
+              const x0 = 300.0, y0 = 250.0, x1 = 724.0, y1 = 774.0, fold = 120.0;
+              final page = Path()
+                ..moveTo(x0 * u, y0 * u)
+                ..lineTo((x1 - fold) * u, y0 * u)
+                ..lineTo(x1 * u, (y0 + fold) * u)
+                ..lineTo(x1 * u, y1 * u)
+                ..lineTo(x0 * u, y1 * u)
+                ..close();
+              canvas.drawPath(page, Paint()..color = Colors.white);
+              final corner = Path()
+                ..moveTo((x1 - fold) * u, y0 * u)
+                ..lineTo(x1 * u, (y0 + fold) * u)
+                ..lineTo((x1 - fold) * u, (y0 + fold) * u)
+                ..close();
+              canvas.drawPath(corner, Paint()..color = const Color(0xFFD7D0FA));
+
+              // text lines
+              final line = Paint()..color = const Color(0xFFA096EB);
+              for (final l in const [[430.0, 300.0], [510.0, 300.0], [590.0, 200.0]]) {
+                canvas.drawRRect(
+                  RRect.fromRectAndRadius(Rect.fromLTWH((x0 + 50) * u, l[0] * u, l[1] * u, 30 * u), Radius.circular(15 * u)),
+                  line,
+                );
+              }
+
+              // sparkles
+              void star(double cx, double cy, double r, Color c) {
+                final k = r * 0.22;
+                final p = Path()
+                  ..moveTo(cx * u, (cy - r) * u)
+                  ..lineTo((cx + k) * u, (cy - k) * u)
+                  ..lineTo((cx + r) * u, cy * u)
+                  ..lineTo((cx + k) * u, (cy + k) * u)
+                  ..lineTo(cx * u, (cy + r) * u)
+                  ..lineTo((cx - k) * u, (cy + k) * u)
+                  ..lineTo((cx - r) * u, cy * u)
+                  ..lineTo((cx - k) * u, (cy - k) * u)
+                  ..close();
+                canvas.drawPath(p, Paint()..color = c);
+              }
+
+              star(x1 - 20, y1 - 30, 105, const Color(0xFFFDCB6E));
+              star(x1 + 90, y1 - 150, 44, Colors.white);
+            }
+
+            @override
+            bool shouldRepaint(covariant CustomPainter old) => false;
+          }
+
+          class NotlioLogo extends StatelessWidget {
+            final double size;
+            const NotlioLogo({super.key, this.size = 36});
+            @override
+            Widget build(BuildContext context) {
+              return SizedBox(width: size, height: size, child: CustomPaint(painter: _LogoPainter()));
+            }
+          }
+          NOTLIOEOF
+
+      - name: "lib/ui.dart (ekranlar)"
         working-directory: app
         run: |
           cat > lib/ui.dart << 'NOTLIOEOF'
@@ -3023,6 +3195,7 @@ jobs:
           import 'code.dart';
           import 'common.dart';
           import 'editor.dart';
+          import 'logo.dart';
           import 'models.dart';
           import 'runner.dart';
 
@@ -3054,6 +3227,7 @@ jobs:
               return Scaffold(
                 appBar: AppBar(
                   title: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                    const Padding(padding: EdgeInsets.only(right: 8, bottom: 2), child: NotlioLogo(size: 30)),
                     const Text('Notlio', style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800)),
                     const SizedBox(width: 8),
                     Padding(
@@ -3733,7 +3907,7 @@ jobs:
                     child: Padding(
                       padding: const EdgeInsets.all(32),
                       child: Column(mainAxisSize: MainAxisSize.min, children: [
-                        const Text('🔒', style: TextStyle(fontSize: 56)),
+                        const NotlioLogo(size: 84),
                         const SizedBox(height: 8),
                         const Text('Notlio', style: TextStyle(fontSize: 28, fontWeight: FontWeight.w800)),
                         const SizedBox(height: 24),
@@ -3755,7 +3929,7 @@ jobs:
           }
           NOTLIOEOF
 
-      - name: lib/main.dart  (giriş)
+      - name: "lib/main.dart (giriş)"
         working-directory: app
         run: |
           cat > lib/main.dart << 'NOTLIOEOF'
@@ -3799,33 +3973,33 @@ jobs:
           }
           NOTLIOEOF
 
-      - name: Bağımlılıkları indir
+      - name: "Bağımlılıkları indir"
         working-directory: app
         run: flutter pub get
 
-      - name: Kod analizi (bilgi amaçlı)
+      - name: "Kod analizi (bilgi amaçlı)"
         working-directory: app
         continue-on-error: true
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
 
-      - name: Release APK derle
+      - name: "Release APK derle"
         working-directory: app
         run: flutter build apk --release
 
-      - name: APK adını düzenle
+      - name: "APK adını düzenle"
         run: |
           mkdir -p out
           cp app/build/app/outputs/flutter-apk/app-release.apk out/Notlio.apk
           ls -lh out/Notlio.apk
 
-      - name: Artifact olarak yükle
+      - name: "Artifact olarak yükle"
         uses: actions/upload-artifact@v4
         with:
           name: Notlio-APK
           path: out/Notlio.apk
           retention-days: 30
 
-      - name: Releases bölümüne ekle
+      - name: "Releases bölümüne ekle"
         uses: softprops/action-gh-release@v2
         with:
           tag_name: notlio-v1.${{ github.run_number }}
