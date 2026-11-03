@@ -1,0 +1,3834 @@
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  NOTLIO  •  Not×Land                                         ║
+# ║  Tek dosya: hem uygulamanın tüm kodu hem APK derleme işi.    ║
+# ╚══════════════════════════════════════════════════════════════╝
+#
+# KULLANIM
+#   1) Bu dosyayı GitHub deposuna şu yola koy:  .github/workflows/notlio.yml
+#   2) Push et (ya da Actions sekmesi > "Notlio APK" > Run workflow).
+#   3) Bitince APK iki yerde olur:
+#        - Actions > çalışma > Artifacts > Notlio-APK
+#        - Releases bölümü (telefondan indirmek en kolayı)
+#
+# İÇİNDEKİLER (Dart dosyaları sırayla):
+#   models.dart  veri modeli, saklama, AES şifreleme, parola
+#   runner.dart  kod çalıştırma (JS/HTML/CSS/JSON/XML/YAML yerelde, diğerleri sunucuda)
+#   ai.dart      API anahtarı analizi, şirket/model seçimi, AI paneli
+#   common.dart  emoji/sticker setleri, renkler, kâğıt desenleri, not kartı
+#   editor.dart  öğrenci not editörü + çizim sayfası
+#   code.dart    yazılımcı editörü (renklendirme, satır no, ▶ çalıştır)
+#   ui.dart      ana ekran, defterler, arama, ayarlar, çöp kutusu, kilit
+#   main.dart    giriş noktası ve tema
+#
+name: Notlio APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/notlio.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: notlio-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: APK derle
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Depoyu al
+        uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Flutter kur
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+          cache: true
+
+      - name: Flutter projesini oluştur
+        run: |
+          flutter --version
+          flutter create --org com.notlio --project-name notlio --platforms android --description "Notlio - Not x Land" app
+          rm -rf app/test
+          rm -f app/lib/main.dart
+
+      - name: pubspec.yaml
+        working-directory: app
+        run: |
+          cat > pubspec.yaml << 'NOTLIOEOF'
+          name: notlio
+          description: Notlio - Not x Land
+          publish_to: 'none'
+          version: 1.0.0+1
+
+          environment:
+            sdk: '>=3.5.0 <4.0.0'
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            path_provider: ^2.1.4
+            http: ^1.2.2
+            crypto: ^3.0.5
+            encrypt: ^5.0.3
+            file_picker: ^8.1.2
+            image_picker: ^1.1.2
+            share_plus: ^10.0.2
+            speech_to_text: ^7.0.0
+            webview_flutter: ^4.9.0
+            audioplayers: ^6.1.0
+            open_filex: ^4.5.0
+
+          flutter:
+            uses-material-design: true
+          NOTLIOEOF
+
+      - name: Android ayarları (izinler, SDK, ad)
+        working-directory: app
+        run: |
+          python3 - << 'NOTLIOEOF'
+          import re
+          mf = 'android/app/src/main/AndroidManifest.xml'
+          s = open(mf, encoding='utf-8').read()
+          perms = (
+              '    <uses-permission android:name="android.permission.INTERNET"/>\n'
+              '    <uses-permission android:name="android.permission.RECORD_AUDIO"/>\n'
+              '    <uses-permission android:name="android.permission.CAMERA"/>\n'
+              '    <uses-permission android:name="android.permission.BLUETOOTH"/>\n'
+              '    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>\n'
+          )
+          s = s.replace('<application', perms + '    <application', 1)
+          extra = (
+              '<intent><action android:name="android.speech.RecognitionService"/></intent>'
+              '<intent><action android:name="android.intent.action.VIEW"/><data android:mimeType="application/pdf"/></intent>'
+              '<intent><action android:name="android.intent.action.VIEW"/><data android:mimeType="*/*"/></intent>'
+          )
+          if '<queries>' in s:
+              s = s.replace('<queries>', '<queries>' + extra, 1)
+          else:
+              s = s.replace('</manifest>', '<queries>' + extra + '</queries></manifest>', 1)
+          s = re.sub(r'android:label="[^"]*"', 'android:label="Notlio"', s, count=1)
+          open(mf, 'w', encoding='utf-8').write(s)
+
+          import glob
+          for g in glob.glob('android/app/build.gradle*'):
+              t = open(g, encoding='utf-8').read()
+              t = re.sub(r'compileSdk(Version)?\s*=?\s*flutter\.compileSdkVersion', 'compileSdk = 35', t)
+              t = re.sub(r'minSdk(Version)?\s*=?\s*flutter\.minSdkVersion', 'minSdk = 24', t)
+              open(g, 'w', encoding='utf-8').write(t)
+
+          with open('android/gradle.properties', 'a', encoding='utf-8') as f:
+              f.write('\nandroid.suppressUnsupportedCompileSdk=35\n')
+              f.write('org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G\n')
+          print(open(mf, encoding='utf-8').read())
+          NOTLIOEOF
+
+      - name: lib/models.dart  (veri modeli, saklama, şifreleme)
+        working-directory: app
+        run: |
+          cat > lib/models.dart << 'NOTLIOEOF'
+          import 'dart:async';
+          import 'dart:convert';
+          import 'dart:io';
+          import 'dart:typed_data';
+          import 'package:crypto/crypto.dart';
+          import 'package:encrypt/encrypt.dart' as enc;
+          import 'package:flutter/foundation.dart';
+          import 'package:path_provider/path_provider.dart';
+
+          const int kMaxNotebookChars = 5000000;
+          const int kAiMaxChars = 1000000;
+
+          int _idCounter = 0;
+          String newId() {
+            _idCounter++;
+            return '${DateTime.now().microsecondsSinceEpoch}$_idCounter';
+          }
+
+          class Attachment {
+            String type; // image, gif, audio, file, sticker
+            String path;
+            String name;
+            Attachment({required this.type, required this.path, this.name = ''});
+            Map<String, dynamic> toJson() => {'type': type, 'path': path, 'name': name};
+            factory Attachment.fromJson(Map<String, dynamic> j) => Attachment(
+                  type: (j['type'] ?? 'file').toString(),
+                  path: (j['path'] ?? '').toString(),
+                  name: (j['name'] ?? '').toString(),
+                );
+          }
+
+          class Stroke {
+            int color;
+            double width;
+            List<double> pts; // normalized 0..1 (x,y,x,y...)
+            String? emoji;
+            Stroke(this.color, this.width, this.pts, {this.emoji});
+            Map<String, dynamic> toJson() => {'c': color, 'w': width, 'p': pts, 'e': emoji};
+            factory Stroke.fromJson(Map<String, dynamic> j) => Stroke(
+                  (j['c'] as num?)?.toInt() ?? 0xFF000000,
+                  (j['w'] as num?)?.toDouble() ?? 3.0,
+                  ((j['p'] as List?) ?? []).map((e) => (e as num).toDouble()).toList(),
+                  emoji: j['e'] as String?,
+                );
+          }
+
+          class Note {
+            String id;
+            String title;
+            String text;
+            String lang; // '' = normal note, otherwise code language id
+            int bg; // 0 = default
+            String pattern; // none, lined, grid, dots
+            bool pinned;
+            bool trashed;
+            int created;
+            int updated;
+            int trashedAt;
+            List<Attachment> atts;
+            List<Stroke> strokes;
+            List<String> tags;
+
+            Note({
+              String? id,
+              this.title = '',
+              this.text = '',
+              this.lang = '',
+              this.bg = 0,
+              this.pattern = 'none',
+              this.pinned = false,
+              this.trashed = false,
+              this.trashedAt = 0,
+              int? created,
+              int? updated,
+              List<Attachment>? atts,
+              List<Stroke>? strokes,
+              List<String>? tags,
+            })  : id = id ?? newId(),
+                  created = created ?? DateTime.now().millisecondsSinceEpoch,
+                  updated = updated ?? DateTime.now().millisecondsSinceEpoch,
+                  atts = atts ?? [],
+                  strokes = strokes ?? [],
+                  tags = tags ?? [];
+
+            bool get isCode => lang.isNotEmpty;
+
+            Map<String, dynamic> toJson() => {
+                  'id': id,
+                  'title': title,
+                  'text': text,
+                  'lang': lang,
+                  'bg': bg,
+                  'pattern': pattern,
+                  'pinned': pinned,
+                  'trashed': trashed,
+                  'trashedAt': trashedAt,
+                  'created': created,
+                  'updated': updated,
+                  'atts': atts.map((e) => e.toJson()).toList(),
+                  'strokes': strokes.map((e) => e.toJson()).toList(),
+                  'tags': tags,
+                };
+
+            factory Note.fromJson(Map<String, dynamic> j) => Note(
+                  id: j['id']?.toString(),
+                  title: (j['title'] ?? '').toString(),
+                  text: (j['text'] ?? '').toString(),
+                  lang: (j['lang'] ?? '').toString(),
+                  bg: (j['bg'] as num?)?.toInt() ?? 0,
+                  pattern: (j['pattern'] ?? 'none').toString(),
+                  pinned: j['pinned'] == true,
+                  trashed: j['trashed'] == true,
+                  trashedAt: (j['trashedAt'] as num?)?.toInt() ?? 0,
+                  created: (j['created'] as num?)?.toInt(),
+                  updated: (j['updated'] as num?)?.toInt(),
+                  atts: ((j['atts'] as List?) ?? [])
+                      .map((e) => Attachment.fromJson(Map<String, dynamic>.from(e as Map)))
+                      .toList(),
+                  strokes: ((j['strokes'] as List?) ?? [])
+                      .map((e) => Stroke.fromJson(Map<String, dynamic>.from(e as Map)))
+                      .toList(),
+                  tags: ((j['tags'] as List?) ?? []).map((e) => e.toString()).toList(),
+                );
+          }
+
+          class Notebook {
+            String id;
+            String name;
+            String kind; // student | dev
+            String emoji;
+            List<Note> notes;
+            Notebook({String? id, required this.name, required this.kind, this.emoji = '📒', List<Note>? notes})
+                : id = id ?? newId(),
+                  notes = notes ?? [];
+
+            int get chars => notes.fold<int>(0, (s, n) => s + n.text.length + n.title.length);
+
+            Map<String, dynamic> toJson() => {
+                  'id': id,
+                  'name': name,
+                  'kind': kind,
+                  'emoji': emoji,
+                  'notes': notes.map((e) => e.toJson()).toList(),
+                };
+
+            factory Notebook.fromJson(Map<String, dynamic> j) => Notebook(
+                  id: j['id']?.toString(),
+                  name: (j['name'] ?? 'Defter').toString(),
+                  kind: (j['kind'] ?? 'student').toString(),
+                  emoji: (j['emoji'] ?? '📒').toString(),
+                  notes: ((j['notes'] as List?) ?? [])
+                      .map((e) => Note.fromJson(Map<String, dynamic>.from(e as Map)))
+                      .toList(),
+                );
+          }
+
+          class Hit {
+            final Notebook notebook;
+            final Note note;
+            Hit(this.notebook, this.note);
+          }
+
+          class Store extends ChangeNotifier {
+            static final Store I = Store._();
+            Store._();
+
+            List<Notebook> notebooks = [];
+            bool dark = false;
+            int accent = 0xFF6C5CE7;
+            double fontSize = 16;
+            String apiKey = '';
+            String provider = '';
+            String baseUrl = '';
+            String model = '';
+            List<String> models = [];
+            String pistonUrl = 'https://emkc.org/api/v2/piston/execute';
+            bool encrypted = false;
+            bool locked = false;
+            bool ready = false;
+            String? _pass;
+            late Directory dir;
+            Timer? _timer;
+
+            File get _dataFile => File('${dir.path}/notlio_data.json');
+            File get _lockFile => File('${dir.path}/notlio_lock.txt');
+            bool get hasLock => _lockFile.existsSync();
+            bool get hasAi => apiKey.isNotEmpty && provider.isNotEmpty;
+
+            String _hash(String p) => sha256.convert(utf8.encode('notlio::$p')).toString();
+
+            enc.Key _key(String p) => enc.Key(Uint8List.fromList(sha256.convert(utf8.encode('notlio-aes::$p')).bytes));
+
+            String _encrypt(String plain, String p) {
+              final iv = enc.IV.fromLength(16);
+              final e = enc.Encrypter(enc.AES(_key(p), mode: enc.AESMode.cbc));
+              final out = e.encrypt(plain, iv: iv);
+              return 'NLE1:${iv.base64}:${out.base64}';
+            }
+
+            String _decrypt(String raw, String p) {
+              final parts = raw.split(':');
+              final e = enc.Encrypter(enc.AES(_key(p), mode: enc.AESMode.cbc));
+              return e.decrypt(enc.Encrypted.fromBase64(parts[2]), iv: enc.IV.fromBase64(parts[1]));
+            }
+
+            Future<void> init() async {
+              dir = await getApplicationDocumentsDirectory();
+              await Directory('${dir.path}/media').create(recursive: true);
+              if (_dataFile.existsSync()) {
+                final raw = await _dataFile.readAsString();
+                if (raw.startsWith('NLE1:')) {
+                  encrypted = true;
+                  locked = true;
+                } else {
+                  _parse(raw);
+                  locked = hasLock;
+                }
+              } else {
+                _seed();
+                await saveNow();
+              }
+              ready = true;
+              notifyListeners();
+            }
+
+            void _parse(String raw) {
+              try {
+                final j = jsonDecode(raw) as Map<String, dynamic>;
+                final s = Map<String, dynamic>.from((j['settings'] as Map?) ?? {});
+                dark = s['dark'] == true;
+                accent = (s['accent'] as num?)?.toInt() ?? 0xFF6C5CE7;
+                fontSize = (s['fontSize'] as num?)?.toDouble() ?? 16;
+                apiKey = (s['apiKey'] ?? '').toString();
+                provider = (s['provider'] ?? '').toString();
+                baseUrl = (s['baseUrl'] ?? '').toString();
+                model = (s['model'] ?? '').toString();
+                models = ((s['models'] as List?) ?? []).map((e) => e.toString()).toList();
+                pistonUrl = (s['pistonUrl'] ?? pistonUrl).toString();
+                notebooks = ((j['notebooks'] as List?) ?? [])
+                    .map((e) => Notebook.fromJson(Map<String, dynamic>.from(e as Map)))
+                    .toList();
+                final limit = DateTime.now().millisecondsSinceEpoch - 30 * 24 * 3600 * 1000;
+                for (final nb in notebooks) {
+                  nb.notes.removeWhere((n) => n.trashed && n.trashedAt > 0 && n.trashedAt < limit);
+                }
+              } catch (e) {
+                notebooks = [];
+              }
+              if (notebooks.isEmpty) _seed();
+            }
+
+            void _seed() {
+              notebooks = [
+                Notebook(name: 'Derslerim', kind: 'student', emoji: '🎓', notes: [
+                  Note(
+                    title: 'Not×Land\'e hoş geldin 👋',
+                    text: 'Notlio\'da her defter bir diyar.\n\n'
+                        '☐ Sağ alttaki + ile yeni not aç\n'
+                        '☐ Üstteki ✦ simgesiyle yapay zekayı çağır\n'
+                        '☐ Alttaki araç çubuğuyla emoji, sticker, resim, GIF, ses, PDF ve çizim ekle\n'
+                        '☐ Yazılımcı sekmesinde kodu ▶ ile çalıştır\n\n'
+                        'Hesap yok, reklam yok, her şey telefonunda.',
+                    pinned: true,
+                    pattern: 'lined',
+                  ),
+                ]),
+                Notebook(name: 'Kodlarım', kind: 'dev', emoji: '💻', notes: [
+                  Note(title: 'Merhaba JS', lang: 'js', text: "console.log('Merhaba Notlio!');\nfor (let i = 1; i <= 3; i++) {\n  console.log('Sayı: ' + i);\n}\n"),
+                ]),
+              ];
+            }
+
+            Map<String, dynamic> _toMap() => {
+                  'v': 1,
+                  'settings': {
+                    'dark': dark,
+                    'accent': accent,
+                    'fontSize': fontSize,
+                    'apiKey': apiKey,
+                    'provider': provider,
+                    'baseUrl': baseUrl,
+                    'model': model,
+                    'models': models,
+                    'pistonUrl': pistonUrl,
+                  },
+                  'notebooks': notebooks.map((e) => e.toJson()).toList(),
+                };
+
+            void save() {
+              _timer?.cancel();
+              _timer = Timer(const Duration(milliseconds: 600), () {
+                saveNow();
+              });
+            }
+
+            void refresh() {
+              save();
+              notifyListeners();
+            }
+
+            Future<void> saveNow() async {
+              try {
+                var s = jsonEncode(_toMap());
+                if (encrypted && _pass != null) s = _encrypt(s, _pass!);
+                final tmp = File('${_dataFile.path}.tmp');
+                await tmp.writeAsString(s, flush: true);
+                await tmp.rename(_dataFile.path);
+              } catch (e) {
+                debugPrint('save error: $e');
+              }
+            }
+
+            Future<bool> unlock(String p) async {
+              try {
+                if (encrypted) {
+                  final raw = await _dataFile.readAsString();
+                  final plain = _decrypt(raw, p);
+                  _parse(plain);
+                  _pass = p;
+                  locked = false;
+                  notifyListeners();
+                  return true;
+                }
+                if (_lockFile.existsSync() && (await _lockFile.readAsString()).trim() == _hash(p)) {
+                  _pass = p;
+                  locked = false;
+                  notifyListeners();
+                  return true;
+                }
+              } catch (e) {
+                return false;
+              }
+              return false;
+            }
+
+            Future<void> setLock(String p, bool encrypt) async {
+              await _lockFile.writeAsString(_hash(p));
+              _pass = p;
+              encrypted = encrypt;
+              await saveNow();
+              notifyListeners();
+            }
+
+            Future<void> setEncrypt(bool v) async {
+              if (v && _pass == null) return;
+              encrypted = v;
+              await saveNow();
+              notifyListeners();
+            }
+
+            Future<void> removeLock() async {
+              if (_lockFile.existsSync()) await _lockFile.delete();
+              encrypted = false;
+              _pass = null;
+              await saveNow();
+              notifyListeners();
+            }
+
+            // ---- queries ----
+            List<Notebook> byKind(String kind) => notebooks.where((n) => n.kind == kind).toList();
+
+            List<Hit> allHits({bool trashed = false}) {
+              final out = <Hit>[];
+              for (final nb in notebooks) {
+                for (final n in nb.notes) {
+                  if (n.trashed == trashed) out.add(Hit(nb, n));
+                }
+              }
+              return out;
+            }
+
+            Notebook? notebookOf(Note n) {
+              for (final nb in notebooks) {
+                if (nb.notes.any((x) => x.id == n.id)) return nb;
+              }
+              return null;
+            }
+
+            List<Note> sortedNotes(Notebook nb) {
+              final l = nb.notes.where((n) => !n.trashed).toList();
+              l.sort((a, b) {
+                if (a.pinned != b.pinned) return a.pinned ? -1 : 1;
+                return b.updated.compareTo(a.updated);
+              });
+              return l;
+            }
+
+            void trash(Note n) {
+              n.trashed = true;
+              n.pinned = false;
+              n.trashedAt = DateTime.now().millisecondsSinceEpoch;
+              refresh();
+            }
+
+            void restore(Note n) {
+              n.trashed = false;
+              n.trashedAt = 0;
+              n.updated = DateTime.now().millisecondsSinceEpoch;
+              refresh();
+            }
+
+            void deleteForever(Note n) {
+              for (final nb in notebooks) {
+                nb.notes.removeWhere((x) => x.id == n.id);
+              }
+              refresh();
+            }
+
+            void moveNote(Note n, Notebook to) {
+              for (final nb in notebooks) {
+                nb.notes.removeWhere((x) => x.id == n.id);
+              }
+              to.notes.add(n);
+              refresh();
+            }
+
+            Note duplicate(Note n, Notebook nb) {
+              final c = Note.fromJson(Map<String, dynamic>.from(jsonDecode(jsonEncode(n.toJson())) as Map));
+              c.id = newId();
+              c.title = '${n.title} (kopya)';
+              c.pinned = false;
+              nb.notes.add(c);
+              refresh();
+              return c;
+            }
+
+            String contextFor(String scope, Notebook? nb, Note? note) {
+              if (scope == 'note' && note != null) {
+                final head = note.isCode ? 'Kod notu (${note.lang}): ${note.title}\n' : 'Not: ${note.title}\n';
+                return head + note.text;
+              }
+              final buf = StringBuffer();
+              final hits = <Hit>[];
+              if (scope == 'notebook' && nb != null) {
+                for (final n in nb.notes.where((n) => !n.trashed)) {
+                  hits.add(Hit(nb, n));
+                }
+              } else if (scope == 'all') {
+                hits.addAll(allHits());
+              }
+              hits.sort((a, b) => b.note.updated.compareTo(a.note.updated));
+              for (final h in hits) {
+                final piece = '### [${h.notebook.name}] ${h.note.title}\n${h.note.text}\n\n';
+                if (buf.length + piece.length > kAiMaxChars) break;
+                buf.write(piece);
+              }
+              return buf.toString();
+            }
+
+            Future<String> keepFile(String src, String name) async {
+              final safe = name.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+              final dest = '${dir.path}/media/${DateTime.now().millisecondsSinceEpoch}_$safe';
+              await File(src).copy(dest);
+              return dest;
+            }
+
+            Future<File> exportFile() async {
+              final tmp = await getTemporaryDirectory();
+              final f = File('${tmp.path}/notlio_yedek.json');
+              final m = _toMap();
+              (m['settings'] as Map<String, dynamic>)['apiKey'] = '';
+              await f.writeAsString(jsonEncode(m));
+              return f;
+            }
+
+            int importJson(String raw) {
+              final j = jsonDecode(raw) as Map<String, dynamic>;
+              final list = ((j['notebooks'] as List?) ?? [])
+                  .map((e) => Notebook.fromJson(Map<String, dynamic>.from(e as Map)))
+                  .toList();
+              for (final nb in list) {
+                final idx = notebooks.indexWhere((x) => x.id == nb.id);
+                if (idx >= 0) {
+                  notebooks[idx] = nb;
+                } else {
+                  notebooks.add(nb);
+                }
+              }
+              refresh();
+              return list.length;
+            }
+          }
+          NOTLIOEOF
+
+      - name: lib/runner.dart  (kod çalıştırma motoru)
+        working-directory: app
+        run: |
+          cat > lib/runner.dart << 'NOTLIOEOF'
+          import 'dart:async';
+          import 'dart:convert';
+          import 'package:http/http.dart' as http;
+          import 'models.dart';
+
+          class LangInfo {
+            final String id, name, ext, piston, starter;
+            final bool local;
+            const LangInfo(this.id, this.name, this.ext, this.piston, this.local, this.starter);
+          }
+
+          const List<LangInfo> kLangs = [
+            LangInfo('cpp', 'C++', 'cpp', 'c++', false,
+                '#include <iostream>\nusing namespace std;\n\nint main() {\n    cout << "Merhaba Notlio!" << endl;\n    return 0;\n}\n'),
+            LangInfo('c', 'C', 'c', 'c', false,
+                '#include <stdio.h>\n\nint main() {\n    printf("Merhaba Notlio!\\n");\n    return 0;\n}\n'),
+            LangInfo('csharp', 'C#', 'cs', 'csharp', false,
+                'using System;\n\nclass Program {\n    static void Main() {\n        Console.WriteLine("Merhaba Notlio!");\n    }\n}\n'),
+            LangInfo('html', 'HTML', 'html', '', true,
+                '<!DOCTYPE html>\n<html>\n<body style="font-family:sans-serif;text-align:center">\n  <h1>Merhaba Notlio!</h1>\n  <button onclick="this.textContent=\'Çalışıyor!\'">Tıkla</button>\n</body>\n</html>\n'),
+            LangInfo('css', 'CSS', 'css', '', true,
+                'body { background: #fdf6e3; font-family: sans-serif; }\nh1 { color: #6c5ce7; text-align: center; }\np { color: #444; }\nbutton { padding: 10px 18px; border-radius: 12px; }\n'),
+            LangInfo('json', 'JSON', 'json', '', true, '{\n  "ad": "Notlio",\n  "surum": 1,\n  "ozellikler": ["not", "kod", "ai"]\n}\n'),
+            LangInfo('js', 'JavaScript', 'js', '', true,
+                "console.log('Merhaba Notlio!');\nconst kare = x => x * x;\nconsole.log([1, 2, 3].map(kare));\n"),
+            LangInfo('python', 'Python', 'py', 'python', false,
+                'print("Merhaba Notlio!")\nfor i in range(3):\n    print("Sayı:", i)\n'),
+            LangInfo('xml', 'XML', 'xml', '', true,
+                '<?xml version="1.0" encoding="UTF-8"?>\n<notlar>\n  <not id="1">Merhaba</not>\n</notlar>\n'),
+            LangInfo('yaml', 'YAML', 'yml', '', true, 'ad: Notlio\nsurum: 1\nozellikler:\n  - not\n  - kod\n  - ai\n'),
+            LangInfo('java', 'Java', 'java', 'java', false,
+                'public class Main {\n    public static void main(String[] args) {\n        System.out.println("Merhaba Notlio!");\n    }\n}\n'),
+            LangInfo('kotlin', 'Kotlin', 'kt', 'kotlin', false, 'fun main() {\n    println("Merhaba Notlio!")\n}\n'),
+            LangInfo('php', 'PHP', 'php', 'php', false, '<?php\necho "Merhaba Notlio!\\n";\n'),
+            LangInfo('go', 'Go', 'go', 'go', false,
+                'package main\n\nimport "fmt"\n\nfunc main() {\n    fmt.Println("Merhaba Notlio!")\n}\n'),
+            LangInfo('rust', 'Rust', 'rs', 'rust', false, 'fn main() {\n    println!("Merhaba Notlio!");\n}\n'),
+            LangInfo('sql', 'SQL', 'sql', 'sqlite3', false,
+                "CREATE TABLE notlar (id INTEGER, baslik TEXT);\nINSERT INTO notlar VALUES (1, 'Merhaba');\nSELECT * FROM notlar;\n"),
+          ];
+
+          LangInfo langOf(String id) => kLangs.firstWhere((l) => l.id == id, orElse: () => kLangs.first);
+
+          class RunResult {
+            final String stdout;
+            final String stderr;
+            final String? html;
+            final bool ok;
+            RunResult({this.stdout = '', this.stderr = '', this.html, this.ok = true});
+          }
+
+          int _lineAt(String s, int offset) {
+            if (offset < 0) return 1;
+            final end = offset > s.length ? s.length : offset;
+            return '\n'.allMatches(s.substring(0, end)).length + 1;
+          }
+
+          Future<RunResult> runCode(String lang, String code, {String stdin = ''}) async {
+            final info = langOf(lang);
+            switch (lang) {
+              case 'html':
+                return RunResult(html: code);
+              case 'css':
+                return RunResult(
+                    html: '<html><head><meta name="viewport" content="width=device-width,initial-scale=1"><style>$code</style></head>'
+                        '<body><h1>Başlık</h1><p>Bu bir örnek paragraftır. CSS kodun burada uygulanır.</p>'
+                        '<button>Düğme</button><ul><li>Bir</li><li>İki</li></ul></body></html>');
+              case 'js':
+                final src = jsonEncode(code).replaceAll('</', '<\\/');
+                return RunResult(
+                    html: '<html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head>'
+                        '<body style="font-family:monospace;padding:8px;font-size:14px"><pre id="o" style="white-space:pre-wrap"></pre><script>'
+                        'var o=document.getElementById("o");'
+                        'function w(a){o.textContent+=Array.prototype.map.call(a,function(x){try{return typeof x==="object"?JSON.stringify(x):String(x)}catch(e){return String(x)}}).join(" ")+"\\n"}'
+                        'console.log=function(){w(arguments)};console.info=console.log;console.warn=console.log;'
+                        'console.error=function(){w(["HATA:"].concat([].slice.call(arguments)))};'
+                        'window.onerror=function(m,s,l){o.textContent+="HATA: "+m+"\\n"};'
+                        'try{(0,eval)($src)}catch(e){o.textContent+="HATA: "+e.name+": "+e.message+"\\n"}'
+                        '</script></body></html>');
+              case 'json':
+                try {
+                  final v = jsonDecode(code);
+                  return RunResult(stdout: const JsonEncoder.withIndent('  ').convert(v));
+                } on FormatException catch (e) {
+                  return RunResult(stderr: 'JSON hatası (satır ${_lineAt(code, e.offset ?? -1)}): ${e.message}', ok: false);
+                }
+              case 'xml':
+                final xerr = _xmlCheck(code);
+                if (xerr != null) return RunResult(stderr: xerr, ok: false);
+                final n = RegExp(r'<[A-Za-z_]').allMatches(code).length;
+                return RunResult(stdout: 'XML geçerli ✓  ($n etiket)');
+              case 'yaml':
+                final yerr = _yamlCheck(code);
+                if (yerr != null) return RunResult(stderr: yerr, ok: false);
+                final keys = RegExp(r'^[A-Za-z_][\w\- ]*:', multiLine: true).allMatches(code).length;
+                return RunResult(stdout: 'Temel YAML denetimi geçti ✓  ($keys üst düzey anahtar)');
+            }
+            return _piston(info, code, stdin);
+          }
+
+          String? _xmlCheck(String src) {
+            var s = src.replaceAllMapped(RegExp(r'<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[\s\S]*?\?>|<!DOCTYPE[^>]*>'),
+                (m) => m.group(0)!.replaceAll(RegExp(r'[^\n]'), ' '));
+            final stack = <MapEntry<String, int>>[];
+            final re = RegExp(r'<(/?)([A-Za-z_][\w:.\-]*)([^<>]*?)(/?)>');
+            var roots = 0;
+            for (final m in re.allMatches(s)) {
+              final line = _lineAt(s, m.start);
+              final closing = m.group(1) == '/';
+              final name = m.group(2)!;
+              final selfClose = m.group(4) == '/';
+              if (closing) {
+                if (stack.isEmpty) return 'XML hatası (satır $line): </$name> için açılış etiketi yok';
+                final top = stack.removeLast();
+                if (top.key != name) {
+                  return 'XML hatası (satır $line): <${top.key}> (satır ${top.value}) kapatılmadan </$name> geldi';
+                }
+              } else if (!selfClose) {
+                if (stack.isEmpty) roots++;
+                stack.add(MapEntry(name, line));
+              } else if (stack.isEmpty) {
+                roots++;
+              }
+            }
+            if (stack.isNotEmpty) return 'XML hatası (satır ${stack.last.value}): <${stack.last.key}> etiketi kapatılmamış';
+            if (roots == 0) return 'XML hatası: hiç etiket bulunamadı';
+            if (roots > 1) return 'XML hatası: birden fazla kök etiket var';
+            final lt = RegExp(r'<(?![A-Za-z_/])').firstMatch(s);
+            if (lt != null) return 'XML hatası (satır ${_lineAt(s, lt.start)}): geçersiz "<" karakteri';
+            return null;
+          }
+
+          String? _yamlCheck(String src) {
+            final lines = src.split('\n');
+            var square = 0, curly = 0;
+            for (var i = 0; i < lines.length; i++) {
+              final l = lines[i];
+              final indent = RegExp(r'^[ \t]*').firstMatch(l)!.group(0)!;
+              if (indent.contains('\t')) return 'YAML hatası (satır ${i + 1}): girintide TAB kullanılamaz, boşluk kullan';
+              final t = l.trim();
+              if (t.isEmpty || t.startsWith('#')) continue;
+              for (final ch in t.split('')) {
+                if (ch == '[') square++;
+                if (ch == ']') square--;
+                if (ch == '{') curly++;
+                if (ch == '}') curly--;
+              }
+              final dq = '"'.allMatches(t).length;
+              if (dq.isOdd && !t.contains("'")) return 'YAML hatası (satır ${i + 1}): tırnak kapatılmamış';
+              if (!t.startsWith('-') && !t.contains(':') && !t.startsWith('|') && !t.startsWith('>') && indent.isEmpty) {
+                return 'YAML hatası (satır ${i + 1}): "anahtar: değer" biçimi bekleniyordu';
+              }
+            }
+            if (square != 0) return 'YAML hatası: [ ] parantezleri eşleşmiyor';
+            if (curly != 0) return 'YAML hatası: { } parantezleri eşleşmiyor';
+            return null;
+          }
+
+          Future<RunResult> _piston(LangInfo info, String code, String stdin) async {
+            try {
+              final body = jsonEncode({
+                'language': info.piston,
+                'version': '*',
+                'files': [
+                  {'name': 'main.${info.ext}', 'content': code}
+                ],
+                'stdin': stdin,
+              });
+              final r = await http
+                  .post(Uri.parse(Store.I.pistonUrl), headers: {'Content-Type': 'application/json'}, body: body)
+                  .timeout(const Duration(seconds: 40));
+              final text = utf8.decode(r.bodyBytes);
+              Map<String, dynamic> j;
+              try {
+                j = jsonDecode(text) as Map<String, dynamic>;
+              } catch (_) {
+                return RunResult(stderr: 'Sunucu cevabı anlaşılamadı (${r.statusCode}).\n$text', ok: false);
+              }
+              if (j['message'] != null && j['run'] == null) {
+                return RunResult(
+                    stderr: 'Sunucu: ${j['message']}\n\nÇalıştırma sunucusu adresini Ayarlar > Kod çalıştırma bölümünden değiştirebilirsin.',
+                    ok: false);
+              }
+              final compile = j['compile'] as Map?;
+              if (compile != null && (compile['code'] ?? 0) != 0) {
+                final out = (compile['output'] ?? compile['stderr'] ?? '').toString();
+                return RunResult(stderr: out, ok: false);
+              }
+              final run = (j['run'] as Map?) ?? {};
+              final so = (run['stdout'] ?? '').toString();
+              final se = (run['stderr'] ?? '').toString();
+              final code0 = run['code'];
+              return RunResult(stdout: so, stderr: se, ok: se.isEmpty && (code0 == null || code0 == 0));
+            } on TimeoutException {
+              return RunResult(stderr: 'Zaman aşımı: sunucu 40 sn içinde cevap vermedi.', ok: false);
+            } catch (e) {
+              return RunResult(
+                  stderr: 'Çalıştırılamadı: $e\n\nBu dil için internet gerekir. Ayarlar > Kod çalıştırma bölümünden sunucu adresini kontrol et.',
+                  ok: false);
+            }
+          }
+          NOTLIOEOF
+
+      - name: lib/ai.dart  (yapay zeka: analiz, model seçimi, panel)
+        working-directory: app
+        run: |
+          cat > lib/ai.dart << 'NOTLIOEOF'
+          import 'dart:async';
+          import 'dart:convert';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:http/http.dart' as http;
+          import 'models.dart';
+
+          class AiCompany {
+            final String id, name, base;
+            const AiCompany(this.id, this.name, this.base);
+          }
+
+          const List<AiCompany> kCompanies = [
+            AiCompany('openai', 'OpenAI', 'https://api.openai.com/v1'),
+            AiCompany('anthropic', 'Anthropic (Claude)', 'https://api.anthropic.com/v1'),
+            AiCompany('gemini', 'Google Gemini', 'https://generativelanguage.googleapis.com/v1beta'),
+            AiCompany('groq', 'Groq', 'https://api.groq.com/openai/v1'),
+            AiCompany('openrouter', 'OpenRouter', 'https://openrouter.ai/api/v1'),
+            AiCompany('xai', 'xAI (Grok)', 'https://api.x.ai/v1'),
+            AiCompany('mistral', 'Mistral', 'https://api.mistral.ai/v1'),
+            AiCompany('deepseek', 'DeepSeek', 'https://api.deepseek.com/v1'),
+            AiCompany('together', 'Together AI', 'https://api.together.xyz/v1'),
+            AiCompany('cerebras', 'Cerebras', 'https://api.cerebras.ai/v1'),
+          ];
+
+          AiCompany? companyOf(String id) {
+            for (final c in kCompanies) {
+              if (c.id == id) return c;
+            }
+            return null;
+          }
+
+          String companyName(String id) => companyOf(id)?.name ?? (id == 'custom' ? 'Özel sağlayıcı' : id);
+
+          class Analysis {
+            final AiCompany? company;
+            final List<String> models;
+            final String error;
+            Analysis(this.company, this.models, this.error);
+          }
+
+          class ChatMsg {
+            final String role; // user | assistant
+            final String text;
+            ChatMsg(this.role, this.text);
+          }
+
+          String _errOf(http.Response r) {
+            try {
+              final j = jsonDecode(utf8.decode(r.bodyBytes));
+              final e = j['error'];
+              if (e is Map && e['message'] != null) return e['message'].toString();
+              if (e is String) return e;
+              if (j['message'] != null) return j['message'].toString();
+            } catch (_) {}
+            return 'HTTP ${r.statusCode}';
+          }
+
+          Future<List<String>> listModels(String id, String base, String key) async {
+            Uri u;
+            Map<String, String> h;
+            if (id == 'anthropic') {
+              u = Uri.parse('$base/models?limit=100');
+              h = {'x-api-key': key, 'anthropic-version': '2023-06-01'};
+            } else if (id == 'gemini') {
+              u = Uri.parse('$base/models?key=$key&pageSize=200');
+              h = {};
+            } else {
+              u = Uri.parse('$base/models');
+              h = {'Authorization': 'Bearer $key'};
+            }
+            final r = await http.get(u, headers: h).timeout(const Duration(seconds: 10));
+            if (r.statusCode != 200) throw Exception(_errOf(r));
+            final j = jsonDecode(utf8.decode(r.bodyBytes));
+            final out = <String>[];
+            if (id == 'gemini') {
+              for (final m in ((j['models'] as List?) ?? [])) {
+                final methods = ((m['supportedGenerationMethods'] as List?) ?? []);
+                if (methods.contains('generateContent')) {
+                  out.add(m['name'].toString().replaceFirst('models/', ''));
+                }
+              }
+            } else {
+              final data = j is Map ? ((j['data'] as List?) ?? []) : (j as List);
+              final skip = RegExp(r'embed|whisper|tts|moderation|dall-e|guard|rerank|transcribe|realtime|audio|image', caseSensitive: false);
+              for (final m in data) {
+                final mid = (m is Map ? m['id'] : m).toString();
+                if (!skip.hasMatch(mid)) out.add(mid);
+              }
+            }
+            out.sort();
+            return out;
+          }
+
+          Future<Analysis> analyzeKey(String keyIn, {String customBase = ''}) async {
+            final key = keyIn.trim();
+            if (key.isEmpty) return Analysis(null, [], 'Anahtar boş');
+            final order = <AiCompany>[];
+            void add(String id) {
+              final c = companyOf(id);
+              if (c != null && !order.contains(c)) order.add(c);
+            }
+
+            if (customBase.trim().isNotEmpty) {
+              order.add(AiCompany('custom', 'Özel sağlayıcı', customBase.trim().replaceAll(RegExp(r'/+$'), '')));
+            } else {
+              if (key.startsWith('sk-ant-')) {
+                add('anthropic');
+              } else if (key.startsWith('AIza')) {
+                add('gemini');
+              } else if (key.startsWith('gsk_')) {
+                add('groq');
+              } else if (key.startsWith('sk-or-')) {
+                add('openrouter');
+              } else if (key.startsWith('xai-')) {
+                add('xai');
+              } else if (key.startsWith('sk-')) {
+                add('openai');
+                add('deepseek');
+              }
+              for (final c in kCompanies) {
+                add(c.id);
+              }
+            }
+            var lastErr = '';
+            for (final c in order) {
+              try {
+                final m = await listModels(c.id, c.base, key);
+                if (m.isNotEmpty) return Analysis(c, m, '');
+              } catch (e) {
+                lastErr = e.toString().replaceFirst('Exception: ', '');
+              }
+            }
+            return Analysis(null, [], lastErr.isEmpty ? 'Model listesi alınamadı' : lastErr);
+          }
+
+          Future<String> aiChat(List<ChatMsg> msgs, String system) async {
+            final s = Store.I;
+            final base = s.baseUrl;
+            final key = s.apiKey;
+            http.Response r;
+            if (s.provider == 'anthropic') {
+              r = await http
+                  .post(Uri.parse('$base/messages'),
+                      headers: {'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json'},
+                      body: jsonEncode({
+                        'model': s.model,
+                        'max_tokens': 8000,
+                        'system': system,
+                        'messages': msgs.map((m) => {'role': m.role, 'content': m.text}).toList(),
+                      }))
+                  .timeout(const Duration(seconds: 120));
+              if (r.statusCode != 200) throw Exception(_errOf(r));
+              final j = jsonDecode(utf8.decode(r.bodyBytes));
+              return ((j['content'] as List?) ?? []).map((e) => (e['text'] ?? '').toString()).join();
+            } else if (s.provider == 'gemini') {
+              r = await http
+                  .post(Uri.parse('$base/models/${s.model}:generateContent?key=$key'),
+                      headers: {'content-type': 'application/json'},
+                      body: jsonEncode({
+                        'systemInstruction': {
+                          'parts': [
+                            {'text': system}
+                          ]
+                        },
+                        'contents': msgs
+                            .map((m) => {
+                                  'role': m.role == 'user' ? 'user' : 'model',
+                                  'parts': [
+                                    {'text': m.text}
+                                  ]
+                                })
+                            .toList(),
+                      }))
+                  .timeout(const Duration(seconds: 120));
+              if (r.statusCode != 200) throw Exception(_errOf(r));
+              final j = jsonDecode(utf8.decode(r.bodyBytes));
+              final parts = (j['candidates']?[0]?['content']?['parts'] as List?) ?? [];
+              return parts.map((e) => (e['text'] ?? '').toString()).join();
+            } else {
+              r = await http
+                  .post(Uri.parse('$base/chat/completions'),
+                      headers: {'Authorization': 'Bearer $key', 'content-type': 'application/json'},
+                      body: jsonEncode({
+                        'model': s.model,
+                        'messages': [
+                          {'role': 'system', 'content': system},
+                          ...msgs.map((m) => {'role': m.role, 'content': m.text}),
+                        ],
+                      }))
+                  .timeout(const Duration(seconds: 120));
+              if (r.statusCode != 200) throw Exception(_errOf(r));
+              final j = jsonDecode(utf8.decode(r.bodyBytes));
+              return (j['choices']?[0]?['message']?['content'] ?? '').toString();
+            }
+          }
+
+          Future<String> transcribeAudio(String path) async {
+            final s = Store.I;
+            String model;
+            if (s.provider == 'groq') {
+              model = 'whisper-large-v3-turbo';
+            } else if (s.provider == 'openai') {
+              model = 'whisper-1';
+            } else {
+              throw Exception('Ses dosyasını yazıya çevirmek için Groq veya OpenAI anahtarı gerekir.');
+            }
+            final req = http.MultipartRequest('POST', Uri.parse('${s.baseUrl}/audio/transcriptions'));
+            req.headers['Authorization'] = 'Bearer ${s.apiKey}';
+            req.fields['model'] = model;
+            req.files.add(await http.MultipartFile.fromPath('file', path));
+            final res = await req.send().timeout(const Duration(seconds: 180));
+            final body = await res.stream.bytesToString();
+            if (res.statusCode != 200) {
+              try {
+                final j = jsonDecode(body);
+                throw Exception(j['error']?['message'] ?? 'HTTP ${res.statusCode}');
+              } catch (e) {
+                if (e is Exception && !e.toString().contains('FormatException')) rethrow;
+                throw Exception('HTTP ${res.statusCode}');
+              }
+            }
+            return (jsonDecode(body)['text'] ?? '').toString();
+          }
+
+          Future<String?> pickModel(BuildContext context, List<String> models, String current) {
+            return showDialog<String>(
+              context: context,
+              builder: (ctx) {
+                String q = '';
+                return StatefulBuilder(builder: (ctx, setS) {
+                  final list = models.where((m) => m.toLowerCase().contains(q.toLowerCase())).toList();
+                  return AlertDialog(
+                    title: const Text('Model seç'),
+                    content: SizedBox(
+                      width: double.maxFinite,
+                      height: 420,
+                      child: Column(children: [
+                        TextField(
+                          decoration: const InputDecoration(prefixIcon: Icon(Icons.search), hintText: 'Model ara', isDense: true),
+                          onChanged: (v) => setS(() => q = v),
+                        ),
+                        const SizedBox(height: 8),
+                        Expanded(
+                          child: ListView.builder(
+                            itemCount: list.length,
+                            itemBuilder: (_, i) => ListTile(
+                              dense: true,
+                              title: Text(list[i], style: const TextStyle(fontSize: 13)),
+                              trailing: list[i] == current ? const Icon(Icons.check, size: 18) : null,
+                              onTap: () => Navigator.pop(ctx, list[i]),
+                            ),
+                          ),
+                        ),
+                      ]),
+                    ),
+                    actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Kapat'))],
+                  );
+                });
+              },
+            );
+          }
+
+          Future<void> changeModel(BuildContext context) async {
+            final s = Store.I;
+            try {
+              final fresh = await listModels(s.provider, s.baseUrl, s.apiKey);
+              if (fresh.isNotEmpty) s.models = fresh;
+            } catch (_) {}
+            if (!context.mounted) return;
+            final m = await pickModel(context, s.models, s.model);
+            if (m != null) {
+              s.model = m;
+              s.refresh();
+            }
+          }
+
+          class AiLogo extends StatelessWidget {
+            final double size;
+            const AiLogo({super.key, this.size = 32});
+            @override
+            Widget build(BuildContext context) {
+              return Container(
+                width: size,
+                height: size,
+                alignment: Alignment.center,
+                decoration: const BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: LinearGradient(colors: [Color(0xFF6C5CE7), Color(0xFFFD79A8)], begin: Alignment.topLeft, end: Alignment.bottomRight),
+                ),
+                child: Text('✦', style: TextStyle(color: Colors.white, fontSize: size * 0.55, height: 1)),
+              );
+            }
+          }
+
+          class AiSetup extends StatefulWidget {
+            final VoidCallback onDone;
+            const AiSetup({super.key, required this.onDone});
+            @override
+            State<AiSetup> createState() => _AiSetupState();
+          }
+
+          class _AiSetupState extends State<AiSetup> {
+            final keyC = TextEditingController();
+            final baseC = TextEditingController();
+            bool busy = false, showBase = false, hide = true;
+            String status = '';
+            Analysis? an;
+            String pick = '';
+
+            @override
+            void initState() {
+              super.initState();
+              keyC.text = Store.I.apiKey;
+              if (Store.I.hasAi) {
+                status = 'Kayıtlı: ${companyName(Store.I.provider)} • ${Store.I.model}';
+              }
+            }
+
+            Future<void> _analyze() async {
+              setState(() {
+                busy = true;
+                status = 'Şirket ve API analiz ediliyor…';
+                an = null;
+              });
+              final r = await analyzeKey(keyC.text, customBase: baseC.text);
+              if (!mounted) return;
+              setState(() {
+                busy = false;
+                an = r;
+                if (r.company != null) {
+                  status = 'Bulundu: ${r.company!.name} • ${r.models.length} model';
+                  pick = r.models.contains(Store.I.model) ? Store.I.model : r.models.first;
+                } else {
+                  status = 'Anahtar tanınmadı: ${r.error}';
+                  showBase = true;
+                }
+              });
+            }
+
+            void _save() {
+              final r = an;
+              if (r == null || r.company == null) return;
+              final s = Store.I;
+              s.apiKey = keyC.text.trim();
+              s.provider = r.company!.id;
+              s.baseUrl = r.company!.base;
+              s.models = r.models;
+              s.model = pick;
+              s.refresh();
+              widget.onDone();
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+                const Text('Yapay zekayı bağla', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+                const SizedBox(height: 6),
+                const Text('Herhangi bir API anahtarını yapıştır. Şirket ve model listesi otomatik bulunur. Anahtar sadece bu telefonda saklanır.',
+                    style: TextStyle(fontSize: 13)),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: keyC,
+                  obscureText: hide,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  decoration: InputDecoration(
+                    labelText: 'API anahtarı',
+                    border: const OutlineInputBorder(),
+                    suffixIcon: IconButton(icon: Icon(hide ? Icons.visibility : Icons.visibility_off), onPressed: () => setState(() => hide = !hide)),
+                  ),
+                ),
+                if (showBase) ...[
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: baseC,
+                    autocorrect: false,
+                    decoration: const InputDecoration(
+                      labelText: 'Özel adres (OpenAI uyumlu, örn. https://site.com/v1)',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 10),
+                Row(children: [
+                  FilledButton.icon(
+                    onPressed: busy ? null : _analyze,
+                    icon: busy
+                        ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.search),
+                    label: const Text('Analiz et'),
+                  ),
+                  const SizedBox(width: 10),
+                  if (!showBase) TextButton(onPressed: () => setState(() => showBase = true), child: const Text('Özel adres')),
+                ]),
+                if (status.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 8), child: Text(status, style: const TextStyle(fontSize: 13))),
+                if (an != null && an!.company != null) ...[
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    icon: const Icon(Icons.memory),
+                    label: Text(pick, overflow: TextOverflow.ellipsis),
+                    onPressed: () async {
+                      final m = await pickModel(context, an!.models, pick);
+                      if (m != null) setState(() => pick = m);
+                    },
+                  ),
+                  const SizedBox(height: 8),
+                  FilledButton(onPressed: _save, child: const Text('Kaydet ve kullan')),
+                ],
+              ]);
+            }
+          }
+
+          void showAiPanel(BuildContext context, {Note? note, Notebook? notebook, VoidCallback? onApplied, String? initial}) {
+            showModalBottomSheet(
+              context: context,
+              isScrollControlled: true,
+              useSafeArea: true,
+              backgroundColor: Colors.transparent,
+              builder: (ctx) => Padding(
+                padding: EdgeInsets.only(bottom: MediaQuery.of(ctx).viewInsets.bottom),
+                child: DraggableScrollableSheet(
+                  initialChildSize: 0.62,
+                  minChildSize: 0.35,
+                  maxChildSize: 0.95,
+                  expand: false,
+                  builder: (ctx, sc) => Material(
+                    color: Theme.of(ctx).colorScheme.surface,
+                    borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+                    clipBehavior: Clip.antiAlias,
+                    child: AiPanel(note: note, notebook: notebook, onApplied: onApplied, initial: initial, scroll: sc),
+                  ),
+                ),
+              ),
+            );
+          }
+
+          class AiPanel extends StatefulWidget {
+            final Note? note;
+            final Notebook? notebook;
+            final VoidCallback? onApplied;
+            final String? initial;
+            final ScrollController scroll;
+            const AiPanel({super.key, this.note, this.notebook, this.onApplied, this.initial, required this.scroll});
+            @override
+            State<AiPanel> createState() => _AiPanelState();
+          }
+
+          class _AiPanelState extends State<AiPanel> {
+            final input = TextEditingController();
+            final List<ChatMsg> msgs = [];
+            bool loading = false;
+            String scope = 'all';
+
+            @override
+            void initState() {
+              super.initState();
+              scope = widget.note != null ? 'note' : (widget.notebook != null ? 'notebook' : 'all');
+              if (widget.initial != null && Store.I.hasAi) {
+                WidgetsBinding.instance.addPostFrameCallback((_) => _send(widget.initial!));
+              }
+            }
+
+            String _system() {
+              final ctx = scope == 'none' ? '' : Store.I.contextFor(scope, widget.notebook, widget.note);
+              return 'Sen Notlio not uygulamasının yapay zeka asistanısın. Kullanıcı Türkçe konuşur; başka dilde yazarsa o dilde cevap ver. Kısa ve net ol.\n'
+                  'Kullanıcının notunda hata varsa (yazım, mantık, kod) bul ve düzelt. Bir işlem isterse (özetle, düzelt, çevir, kod ekle, yeni not aç) yap.\n'
+                  'Notu DEĞİŞTİRMEK için cevabında şu bloğu ver ve içine notun TAM yeni halini yaz:\n'
+                  '```notlio-edit\n...notun tam yeni metni...\n```\n'
+                  'Yeni not oluşturmak için:\n'
+                  '```notlio-new:Başlık\n...içerik...\n```\n'
+                  'Kod notlarında blok içine sadece kodu yaz (içeride ``` veya dil adı yazma). Bloğun dışında en fazla birkaç cümle açıklama yaz.\n'
+                  'Aşağıdaki bağlam kullanıcının notlarıdır:\n'
+                  '$ctx';
+            }
+
+            Future<void> _send(String text) async {
+              final t = text.trim();
+              if (t.isEmpty || loading) return;
+              setState(() {
+                msgs.add(ChatMsg('user', t));
+                loading = true;
+              });
+              input.clear();
+              _toEnd();
+              try {
+                final hist = msgs.length > 12 ? msgs.sublist(msgs.length - 12) : List<ChatMsg>.from(msgs);
+                final ans = await aiChat(hist, _system());
+                if (!mounted) return;
+                setState(() => msgs.add(ChatMsg('assistant', ans.isEmpty ? '(boş cevap)' : ans)));
+              } catch (e) {
+                if (!mounted) return;
+                setState(() => msgs.add(ChatMsg('assistant', '⚠️ Hata: ${e.toString().replaceFirst('Exception: ', '')}')));
+              }
+              if (!mounted) return;
+              setState(() => loading = false);
+              _toEnd();
+            }
+
+            void _toEnd() {
+              Future.delayed(const Duration(milliseconds: 150), () {
+                if (widget.scroll.hasClients) {
+                  widget.scroll.animateTo(widget.scroll.position.maxScrollExtent, duration: const Duration(milliseconds: 200), curve: Curves.easeOut);
+                }
+              });
+            }
+
+            void _apply(String kind, String title, String body) {
+              final s = Store.I;
+              var b = body;
+              if (b.endsWith('\n')) b = b.substring(0, b.length - 1);
+              if (kind == 'edit' && widget.note != null) {
+                widget.note!.text = b;
+                widget.note!.updated = DateTime.now().millisecondsSinceEpoch;
+                s.refresh();
+                widget.onApplied?.call();
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Not güncellendi')));
+              } else {
+                final nb = widget.notebook ?? s.notebookOf(widget.note ?? Note()) ?? (s.notebooks.isNotEmpty ? s.notebooks.first : null);
+                if (nb == null) return;
+                nb.notes.add(Note(title: title.isEmpty ? 'AI notu' : title, text: b, lang: widget.note?.lang ?? ''));
+                s.refresh();
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('"${title.isEmpty ? 'AI notu' : title}" oluşturuldu')));
+              }
+            }
+
+            Widget _bubble(ChatMsg m) {
+              final me = m.role == 'user';
+              final cs = Theme.of(context).colorScheme;
+              final actions = <Widget>[];
+              if (!me) {
+                final re = RegExp(r'```notlio-(edit|new)(?::([^\n]*))?\n([\s\S]*?)```');
+                for (final mt in re.allMatches(m.text)) {
+                  final kind = mt.group(1)!;
+                  final title = (mt.group(2) ?? '').trim();
+                  final body = mt.group(3) ?? '';
+                  if (kind == 'edit' && widget.note == null) continue;
+                  actions.add(Padding(
+                    padding: const EdgeInsets.only(top: 6, right: 6),
+                    child: FilledButton.tonalIcon(
+                      icon: Icon(kind == 'edit' ? Icons.check : Icons.note_add, size: 18),
+                      label: Text(kind == 'edit' ? 'Notu güncelle' : 'Yeni not: ${title.isEmpty ? "AI notu" : title}'),
+                      onPressed: () => _apply(kind, title, body),
+                    ),
+                  ));
+                }
+              }
+              return Align(
+                alignment: me ? Alignment.centerRight : Alignment.centerLeft,
+                child: Container(
+                  margin: const EdgeInsets.symmetric(vertical: 4),
+                  padding: const EdgeInsets.all(12),
+                  constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.88),
+                  decoration: BoxDecoration(
+                    color: me ? cs.primaryContainer : cs.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    SelectableText(m.text, style: const TextStyle(fontSize: 14, height: 1.4)),
+                    if (actions.isNotEmpty) Wrap(children: actions),
+                    if (!me)
+                      InkWell(
+                        onTap: () {
+                          Clipboard.setData(ClipboardData(text: m.text));
+                          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Kopyalandı')));
+                        },
+                        child: const Padding(padding: EdgeInsets.only(top: 6), child: Icon(Icons.copy, size: 14)),
+                      ),
+                  ]),
+                ),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final s = Store.I;
+              if (!s.hasAi) {
+                return ListView(controller: widget.scroll, padding: const EdgeInsets.all(18), children: [
+                  Row(children: const [AiLogo(size: 36), SizedBox(width: 10), Text('Notlio AI', style: TextStyle(fontSize: 20, fontWeight: FontWeight.w800))]),
+                  const SizedBox(height: 14),
+                  AiSetup(onDone: () => setState(() {})),
+                  const SizedBox(height: 8),
+                  const Text('Notlio yapay zeka olmadan da çalışır. Bağlamak istemezsen paneli kapatabilirsin.', style: TextStyle(fontSize: 12)),
+                ]);
+              }
+              final isCode = widget.note?.isCode ?? false;
+              final quick = isCode
+                  ? ['Hatayı bul ve düzelt', 'Kodu açıkla', 'Optimize et', 'Yorum satırı ekle', 'Yeni özellik ekle']
+                  : ['Yazı hatalarını düzelt', 'Özetle', 'Etiket öner', 'Daha iyi yaz', 'Maddelere böl'];
+              return Column(children: [
+                Container(
+                  width: 40,
+                  height: 4,
+                  margin: const EdgeInsets.only(top: 8, bottom: 6),
+                  decoration: BoxDecoration(color: Colors.grey.withOpacity(0.5), borderRadius: BorderRadius.circular(2)),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
+                  child: Row(children: [
+                    const AiLogo(size: 30),
+                    const SizedBox(width: 8),
+                    const Text('Notlio AI', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w800)),
+                    const Spacer(),
+                    Flexible(
+                      child: ActionChip(
+                        avatar: const Icon(Icons.memory, size: 16),
+                        label: Text(s.model, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12)),
+                        onPressed: () async {
+                          await changeModel(context);
+                          if (mounted) setState(() {});
+                        },
+                      ),
+                    ),
+                    IconButton(icon: const Icon(Icons.close), onPressed: () => Navigator.pop(context)),
+                  ]),
+                ),
+                SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                  child: Row(children: [
+                    if (widget.note != null) _scopeChip('note', 'Bu not'),
+                    if (widget.notebook != null) _scopeChip('notebook', 'Bu defter'),
+                    _scopeChip('all', 'Tüm defterler'),
+                    _scopeChip('none', 'Bağlamsız'),
+                  ]),
+                ),
+                if (widget.note != null)
+                  SizedBox(
+                    height: 44,
+                    child: ListView(
+                      scrollDirection: Axis.horizontal,
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      children: quick
+                          .map((q) => Padding(
+                                padding: const EdgeInsets.only(right: 6, top: 4),
+                                child: ActionChip(label: Text(q, style: const TextStyle(fontSize: 12)), onPressed: () => _send(q)),
+                              ))
+                          .toList(),
+                    ),
+                  ),
+                Expanded(
+                  child: msgs.isEmpty
+                      ? ListView(controller: widget.scroll, padding: const EdgeInsets.all(24), children: const [
+                          SizedBox(height: 20),
+                          Center(child: Text('Notlarına dair bir şey sor ya da bir işlem söyle.\nÖrn: "bu notu özetle", "şu kodu düzelt", "yeni not aç".', textAlign: TextAlign.center)),
+                        ])
+                      : ListView(controller: widget.scroll, padding: const EdgeInsets.symmetric(horizontal: 12), children: [
+                          ...msgs.map(_bubble),
+                          if (loading) const Padding(padding: EdgeInsets.all(12), child: Align(alignment: Alignment.centerLeft, child: SizedBox(width: 22, height: 22, child: CircularProgressIndicator(strokeWidth: 2)))),
+                        ]),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
+                  child: Row(children: [
+                    Expanded(
+                      child: TextField(
+                        controller: input,
+                        minLines: 1,
+                        maxLines: 4,
+                        textInputAction: TextInputAction.send,
+                        onSubmitted: _send,
+                        decoration: InputDecoration(
+                          hintText: 'Mesaj yaz…',
+                          filled: true,
+                          isDense: true,
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(22), borderSide: BorderSide.none),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    IconButton.filled(icon: const Icon(Icons.send), onPressed: loading ? null : () => _send(input.text)),
+                  ]),
+                ),
+              ]);
+            }
+
+            Widget _scopeChip(String id, String label) => Padding(
+                  padding: const EdgeInsets.only(right: 6),
+                  child: ChoiceChip(label: Text(label, style: const TextStyle(fontSize: 12)), selected: scope == id, onSelected: (_) => setState(() => scope = id)),
+                );
+          }
+          NOTLIOEOF
+
+      - name: lib/common.dart  (ortak parçalar, emoji, sticker, kâğıt)
+        working-directory: app
+        run: |
+          cat > lib/common.dart << 'NOTLIOEOF'
+          import 'package:flutter/material.dart';
+          import 'models.dart';
+          import 'runner.dart';
+
+          final List<String> kEmojis = ('😀 😃 😄 😁 😆 😅 😂 🤣 😊 😇 🙂 😉 😍 🥰 😘 😋 😎 🤓 🤩 🥳 😏 😒 😞 😔 😢 😭 😤 😡 🤯 😱 😨 😰 🤔 🤗 🫡 🤫 😴 🤒 🤕 🥶 🥵 😵 🤪 😜 '
+                  '👍 👎 👏 🙌 🙏 💪 👀 🧠 ✌️ 🤞 👌 👋 ☝️ ❤️ 🧡 💛 💚 💙 💜 🖤 💔 ✨ ⭐ 🌟 💫 🔥 💥 💯 ✅ ❌ ❓ ❗ ⚠️ 💡 📌 📎 📝 📚 📖 📅 ⏰ 🎯 🏆 🎓 '
+                  '🎮 💻 📱 ⌨️ 🖥️ 🐛 🚀 🔧 🔒 🔑 🌍 🌈 ☀️ 🌙 ⚡ ❄️ 🌸 🌳 🍎 🍕 ☕ 🎵 🎧 📷 🎁 🎉')
+              .split(' ');
+
+          final List<String> kSymbols = ('● ○ ◉ ■ □ ▲ △ ▶ ◀ ◆ ◇ ★ ☆ ✔ ✘ ☐ ☑ ☒ → ← ↑ ↓ ⇒ ⇐ • ‣ ◦ — – … ° ± × ÷ ≈ ≠ ≤ ≥ ∞ √ π Σ Δ α β γ µ ² ³ ½ ¼ ¾ € ₺ \$ £ © ® ™ § ¶ † ‡ ※ ♠ ♣ ♥ ♦ ♩ ♪ ♫')
+              .split(' ');
+
+          final List<String> kStickers = ('🦊 🐱 🐶 🐼 🐨 🦁 🐸 🐵 🦄 🐙 🦋 🐢 🐧 🦉 🐰 🐻 🐯 🐷 🐮 🐔 🦖 🐳 🐬 🦈 🌵 🌻 🍀 🍄 🍩 🍔 🍦 🧁 🍉 🥑 '
+                  '🚗 ✈️ 🚀 🛸 🏰 🗽 🎈 🎨 🎸 🥁 ⚽ 🏀 🎲 🧩 📚 🔬 🔭 🧪 💎 👑 🪄 🧸 🤖 👾 👻 💀 😺 🙈 💬 💭 🔔 ⏳ 🧭')
+              .split(' ');
+
+          const List<int> kNoteColors = [0, 0xFFFFF3C4, 0xFFFFD6E0, 0xFFD6F0FF, 0xFFD9F7D9, 0xFFE8DEFF, 0xFFFFE3C8, 0xFFE3E3E3];
+          const List<int> kAccents = [0xFF6C5CE7, 0xFF0984E3, 0xFF00B894, 0xFFE17055, 0xFFD63031, 0xFFFD79A8, 0xFFFDCB6E, 0xFF2D3436];
+          const List<int> kPenColors = [0xFF000000, 0xFFD63031, 0xFF0984E3, 0xFF00B894, 0xFFFDCB6E, 0xFF6C5CE7, 0xFFFD79A8, 0xFF636E72];
+
+          Color noteBg(BuildContext c, Note n) {
+            final cs = Theme.of(c).colorScheme;
+            if (n.bg == 0) return cs.surfaceContainerHighest.withOpacity(0.55);
+            final base = Color(n.bg);
+            if (Theme.of(c).brightness == Brightness.dark) {
+              return Color.alphaBlend(Colors.black.withOpacity(0.6), base);
+            }
+            return base;
+          }
+
+          String two(int v) => v.toString().padLeft(2, '0');
+
+          String fmtDate(int ms) {
+            final d = DateTime.fromMillisecondsSinceEpoch(ms);
+            final now = DateTime.now();
+            final hm = '${two(d.hour)}:${two(d.minute)}';
+            if (d.year == now.year && d.month == now.month && d.day == now.day) return 'Bugün $hm';
+            final y = now.subtract(const Duration(days: 1));
+            if (d.year == y.year && d.month == y.month && d.day == y.day) return 'Dün $hm';
+            return '${two(d.day)}.${two(d.month)}.${d.year}';
+          }
+
+          String fmtNum(int n) {
+            final s = n.toString();
+            final b = StringBuffer();
+            for (var i = 0; i < s.length; i++) {
+              if (i > 0 && (s.length - i) % 3 == 0) b.write('.');
+              b.write(s[i]);
+            }
+            return b.toString();
+          }
+
+          Future<bool> confirmDialog(BuildContext context, String title, {String? body, String yes = 'Evet'}) async {
+            final r = await showDialog<bool>(
+              context: context,
+              builder: (ctx) => AlertDialog(
+                title: Text(title),
+                content: body == null ? null : Text(body),
+                actions: [
+                  TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Vazgeç')),
+                  FilledButton(onPressed: () => Navigator.pop(ctx, true), child: Text(yes)),
+                ],
+              ),
+            );
+            return r == true;
+          }
+
+          Future<String?> textDialog(BuildContext context, String title, {String initial = '', String hint = '', bool obscure = false}) {
+            final c = TextEditingController(text: initial);
+            return showDialog<String>(
+              context: context,
+              builder: (ctx) => AlertDialog(
+                title: Text(title),
+                content: TextField(
+                  controller: c,
+                  autofocus: true,
+                  obscureText: obscure,
+                  decoration: InputDecoration(hintText: hint),
+                  onSubmitted: (v) => Navigator.pop(ctx, v),
+                ),
+                actions: [
+                  TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Vazgeç')),
+                  FilledButton(onPressed: () => Navigator.pop(ctx, c.text), child: const Text('Tamam')),
+                ],
+              ),
+            );
+          }
+
+          void toast(BuildContext context, String msg) {
+            ScaffoldMessenger.of(context).hideCurrentSnackBar();
+            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), duration: const Duration(seconds: 2)));
+          }
+
+          class PaperPainter extends CustomPainter {
+            final String pattern;
+            final Color color;
+            PaperPainter(this.pattern, this.color);
+            @override
+            void paint(Canvas canvas, Size size) {
+              if (pattern == 'none') return;
+              final p = Paint()
+                ..color = color
+                ..strokeWidth = 1;
+              const step = 28.0;
+              if (pattern == 'lined') {
+                for (double y = step; y < size.height; y += step) {
+                  canvas.drawLine(Offset(0, y), Offset(size.width, y), p);
+                }
+              } else if (pattern == 'grid') {
+                for (double y = step; y < size.height; y += step) {
+                  canvas.drawLine(Offset(0, y), Offset(size.width, y), p);
+                }
+                for (double x = step; x < size.width; x += step) {
+                  canvas.drawLine(Offset(x, 0), Offset(x, size.height), p);
+                }
+              } else if (pattern == 'dots') {
+                p.strokeWidth = 2.2;
+                for (double y = step; y < size.height; y += step) {
+                  for (double x = step; x < size.width; x += step) {
+                    canvas.drawCircle(Offset(x, y), 1.2, p);
+                  }
+                }
+              }
+            }
+
+            @override
+            bool shouldRepaint(covariant PaperPainter old) => old.pattern != pattern || old.color != color;
+          }
+
+          class StrokesPainter extends CustomPainter {
+            final List<Stroke> strokes;
+            StrokesPainter(this.strokes);
+            @override
+            void paint(Canvas canvas, Size size) {
+              for (final s in strokes) {
+                if (s.emoji != null && s.pts.length >= 2) {
+                  final tp = TextPainter(
+                    text: TextSpan(text: s.emoji, style: TextStyle(fontSize: s.width * size.width / 360 * 8)),
+                    textDirection: TextDirection.ltr,
+                  )..layout();
+                  tp.paint(canvas, Offset(s.pts[0] * size.width - tp.width / 2, s.pts[1] * size.height - tp.height / 2));
+                  continue;
+                }
+                final p = Paint()
+                  ..color = Color(s.color)
+                  ..strokeWidth = s.width * size.width / 360
+                  ..strokeCap = StrokeCap.round
+                  ..strokeJoin = StrokeJoin.round
+                  ..style = PaintingStyle.stroke;
+                if (s.pts.length < 4) {
+                  if (s.pts.length >= 2) {
+                    canvas.drawCircle(Offset(s.pts[0] * size.width, s.pts[1] * size.height), p.strokeWidth / 2, p..style = PaintingStyle.fill);
+                  }
+                  continue;
+                }
+                final path = Path()..moveTo(s.pts[0] * size.width, s.pts[1] * size.height);
+                for (var i = 2; i + 1 < s.pts.length; i += 2) {
+                  path.lineTo(s.pts[i] * size.width, s.pts[i + 1] * size.height);
+                }
+                canvas.drawPath(path, p);
+              }
+            }
+
+            @override
+            bool shouldRepaint(covariant StrokesPainter old) => true;
+          }
+
+          class NoteCard extends StatelessWidget {
+            final Note note;
+            final VoidCallback onTap;
+            final VoidCallback onLong;
+            final bool grid;
+            const NoteCard({super.key, required this.note, required this.onTap, required this.onLong, this.grid = false});
+
+            @override
+            Widget build(BuildContext context) {
+              final cs = Theme.of(context).colorScheme;
+              final bg = noteBg(context, note);
+              final preview = note.text.length > 160 ? note.text.substring(0, 160) : note.text;
+              return Padding(
+                padding: grid ? EdgeInsets.zero : const EdgeInsets.only(bottom: 10),
+                child: Material(
+                  color: bg,
+                  borderRadius: BorderRadius.circular(18),
+                  clipBehavior: Clip.antiAlias,
+                  child: InkWell(
+                    onTap: onTap,
+                    onLongPress: onLong,
+                    child: Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: grid ? MainAxisSize.max : MainAxisSize.min, children: [
+                        Row(children: [
+                          if (note.pinned) const Padding(padding: EdgeInsets.only(right: 4), child: Text('📌', style: TextStyle(fontSize: 13))),
+                          Expanded(
+                            child: Text(
+                              note.title.isEmpty ? 'Başlıksız' : note.title,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w700),
+                            ),
+                          ),
+                          if (note.isCode)
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                              decoration: BoxDecoration(color: cs.primary, borderRadius: BorderRadius.circular(10)),
+                              child: Text(langOf(note.lang).name, style: TextStyle(color: cs.onPrimary, fontSize: 11, fontWeight: FontWeight.w700)),
+                            ),
+                        ]),
+                        const SizedBox(height: 6),
+                        if (grid)
+                          Expanded(
+                            child: Text(preview.isEmpty ? 'Boş not' : preview,
+                                maxLines: 5,
+                                overflow: TextOverflow.fade,
+                                style: TextStyle(fontSize: 13, height: 1.3, color: cs.onSurface.withOpacity(0.75), fontFamily: note.isCode ? 'monospace' : null)),
+                          )
+                        else
+                          Text(preview.isEmpty ? 'Boş not' : preview,
+                              maxLines: 3,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(fontSize: 13, height: 1.3, color: cs.onSurface.withOpacity(0.75), fontFamily: note.isCode ? 'monospace' : null)),
+                        const SizedBox(height: 8),
+                        Row(children: [
+                          Text(fmtDate(note.updated), style: TextStyle(fontSize: 11, color: cs.onSurface.withOpacity(0.55))),
+                          const Spacer(),
+                          if (note.atts.isNotEmpty) Text('📎${note.atts.length} ', style: const TextStyle(fontSize: 11)),
+                          if (note.strokes.isNotEmpty) const Text('✏️ ', style: TextStyle(fontSize: 11)),
+                          if (note.tags.isNotEmpty) Text('#${note.tags.first}', style: TextStyle(fontSize: 11, color: cs.primary)),
+                        ]),
+                      ]),
+                    ),
+                  ),
+                ),
+              );
+            }
+          }
+          NOTLIOEOF
+
+      - name: lib/editor.dart  (öğrenci editörü + çizim)
+        working-directory: app
+        run: |
+          cat > lib/editor.dart << 'NOTLIOEOF'
+          import 'dart:async';
+          import 'dart:io';
+          import 'package:audioplayers/audioplayers.dart';
+          import 'package:file_picker/file_picker.dart';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:image_picker/image_picker.dart';
+          import 'package:open_filex/open_filex.dart';
+          import 'package:share_plus/share_plus.dart';
+          import 'package:speech_to_text/speech_to_text.dart' as stt;
+          import 'ai.dart';
+          import 'common.dart';
+          import 'models.dart';
+
+          class LimitFormatter extends TextInputFormatter {
+            final Notebook nb;
+            LimitFormatter(this.nb);
+            @override
+            TextEditingValue formatEditUpdate(TextEditingValue oldV, TextEditingValue newV) {
+              final delta = newV.text.length - oldV.text.length;
+              if (delta > 0 && nb.chars + delta > kMaxNotebookChars) return oldV;
+              return newV;
+            }
+          }
+
+          String attTypeOf(String path) {
+            final e = path.split('.').last.toLowerCase();
+            if (['jpg', 'jpeg', 'png', 'webp', 'bmp', 'heic'].contains(e)) return 'image';
+            if (e == 'gif') return 'gif';
+            if (['mp3', 'm4a', 'wav', 'ogg', 'aac', 'flac', 'opus', 'amr'].contains(e)) return 'audio';
+            return 'file';
+          }
+
+          bool isTextFile(String path) {
+            final e = path.split('.').last.toLowerCase();
+            return ['txt', 'md', 'json', 'csv', 'xml', 'yml', 'yaml', 'html', 'css', 'js', 'py', 'c', 'cpp', 'cs', 'java', 'kt', 'php', 'go', 'rs', 'sql', 'log', 'ini']
+                .contains(e);
+          }
+
+          class NoteEditorPage extends StatefulWidget {
+            final Note note;
+            final Notebook nb;
+            const NoteEditorPage({super.key, required this.note, required this.nb});
+            @override
+            State<NoteEditorPage> createState() => _NoteEditorPageState();
+          }
+
+          class _NoteEditorPageState extends State<NoteEditorPage> {
+            late final TextEditingController tc;
+            late final TextEditingController titleC;
+            final undo = UndoHistoryController();
+            final focus = FocusNode();
+            final speech = stt.SpeechToText();
+            bool listening = false;
+            bool speechOk = false;
+
+            Note get n => widget.note;
+
+            @override
+            void initState() {
+              super.initState();
+              tc = TextEditingController(text: n.text);
+              titleC = TextEditingController(text: n.title);
+            }
+
+            @override
+            void dispose() {
+              speech.stop();
+              Store.I.save();
+              tc.dispose();
+              titleC.dispose();
+              focus.dispose();
+              super.dispose();
+            }
+
+            void _changed() {
+              n.text = tc.text;
+              n.title = titleC.text;
+              n.updated = DateTime.now().millisecondsSinceEpoch;
+              Store.I.save();
+            }
+
+            void _insert(String s) {
+              final t = tc.text;
+              final sel = tc.selection;
+              final start = sel.isValid ? sel.start : t.length;
+              final end = sel.isValid ? sel.end : t.length;
+              if (widget.nb.chars + s.length - (end - start) > kMaxNotebookChars) {
+                toast(context, 'Defter sınırına ulaşıldı (5.000.000 harf)');
+                return;
+              }
+              tc.value = TextEditingValue(text: t.replaceRange(start, end, s), selection: TextSelection.collapsed(offset: start + s.length));
+              _changed();
+            }
+
+            void _checkbox() {
+              final t = tc.text;
+              final sel = tc.selection;
+              final pos = sel.isValid ? sel.start : t.length;
+              final ls = pos == 0 ? 0 : t.lastIndexOf('\n', pos - 1) + 1;
+              String nt;
+              var off = pos;
+              if (t.startsWith('☐ ', ls)) {
+                nt = t.replaceRange(ls, ls + 2, '☑ ');
+              } else if (t.startsWith('☑ ', ls)) {
+                nt = t.replaceRange(ls, ls + 2, '☐ ');
+              } else {
+                nt = t.replaceRange(ls, ls, '☐ ');
+                off = pos + 2;
+              }
+              tc.value = TextEditingValue(text: nt, selection: TextSelection.collapsed(offset: off));
+              _changed();
+            }
+
+            void _addAtt(Attachment a) {
+              setState(() => n.atts.add(a));
+              _changed();
+            }
+
+            Future<void> _pickImage() async {
+              final src = await showModalBottomSheet<ImageSource>(
+                context: context,
+                builder: (ctx) => SafeArea(
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    ListTile(leading: const Icon(Icons.photo_library), title: const Text('Galeri'), onTap: () => Navigator.pop(ctx, ImageSource.gallery)),
+                    ListTile(leading: const Icon(Icons.photo_camera), title: const Text('Kamera'), onTap: () => Navigator.pop(ctx, ImageSource.camera)),
+                  ]),
+                ),
+              );
+              if (src == null) return;
+              try {
+                final x = await ImagePicker().pickImage(source: src, imageQuality: 85, maxWidth: 2000);
+                if (x == null) return;
+                final p = await Store.I.keepFile(x.path, x.name.isEmpty ? 'foto.jpg' : x.name);
+                _addAtt(Attachment(type: attTypeOf(p), path: p, name: x.name));
+              } catch (e) {
+                if (mounted) toast(context, 'Resim eklenemedi: $e');
+              }
+            }
+
+            Future<void> _pickFile(FileType type, {List<String>? ext}) async {
+              try {
+                final r = await FilePicker.platform.pickFiles(type: type, allowedExtensions: ext);
+                if (r == null || r.files.isEmpty || r.files.first.path == null) return;
+                final f = r.files.first;
+                final p = await Store.I.keepFile(f.path!, f.name);
+                _addAtt(Attachment(type: attTypeOf(p), path: p, name: f.name));
+              } catch (e) {
+                if (mounted) toast(context, 'Dosya eklenemedi: $e');
+              }
+            }
+
+            Future<void> _toggleMic() async {
+              if (listening) {
+                await speech.stop();
+                if (mounted) setState(() => listening = false);
+                return;
+              }
+              if (!speechOk) {
+                speechOk = await speech.initialize(
+                  onStatus: (s) {
+                    if ((s == 'done' || s == 'notListening') && mounted) setState(() => listening = false);
+                  },
+                  onError: (e) {
+                    if (mounted) {
+                      setState(() => listening = false);
+                      toast(context, 'Ses hatası: ${e.errorMsg}');
+                    }
+                  },
+                );
+              }
+              if (!speechOk) {
+                if (mounted) toast(context, 'Konuşma tanıma kullanılamıyor. Mikrofon iznini ve Google konuşma servisini kontrol et.');
+                return;
+              }
+              setState(() => listening = true);
+              speech.listen(
+                onResult: (r) {
+                  if (r.finalResult && r.recognizedWords.isNotEmpty) {
+                    final t = tc.text;
+                    final sp = (t.isEmpty || t.endsWith(' ') || t.endsWith('\n')) ? '' : ' ';
+                    _insert('$sp${r.recognizedWords}');
+                  }
+                },
+                localeId: 'tr_TR',
+                listenFor: const Duration(minutes: 2),
+                pauseFor: const Duration(seconds: 6),
+              );
+            }
+
+            void _emojiSheet() {
+              showModalBottomSheet(
+                context: context,
+                builder: (ctx) => SizedBox(
+                  height: 330,
+                  child: DefaultTabController(
+                    length: 3,
+                    child: Column(children: [
+                      const TabBar(tabs: [Tab(text: 'Emoji'), Tab(text: 'Simge'), Tab(text: 'Sticker')]),
+                      Expanded(
+                        child: TabBarView(children: [
+                          _grid(kEmojis, 26, (e) => _insert(e)),
+                          _grid(kSymbols, 24, (e) => _insert(e)),
+                          _grid(kStickers, 28, (e) {
+                            Navigator.pop(ctx);
+                            _addAtt(Attachment(type: 'sticker', path: e, name: 'sticker'));
+                          }),
+                        ]),
+                      ),
+                    ]),
+                  ),
+                ),
+              );
+            }
+
+            Widget _grid(List<String> items, double size, void Function(String) onTap) {
+              return GridView.count(
+                crossAxisCount: 8,
+                padding: const EdgeInsets.all(8),
+                children: items
+                    .map((e) => InkWell(
+                          borderRadius: BorderRadius.circular(10),
+                          onTap: () => onTap(e),
+                          child: Center(child: Text(e, style: TextStyle(fontSize: size))),
+                        ))
+                    .toList(),
+              );
+            }
+
+            void _bgSheet() {
+              showModalBottomSheet(
+                context: context,
+                builder: (ctx) => StatefulBuilder(builder: (ctx, setS) {
+                  return SafeArea(
+                    child: Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        const Text('Arka plan rengi', style: TextStyle(fontWeight: FontWeight.w700)),
+                        const SizedBox(height: 10),
+                        Wrap(
+                          spacing: 10,
+                          runSpacing: 10,
+                          children: kNoteColors.map((c) {
+                            final sel = n.bg == c;
+                            return GestureDetector(
+                              onTap: () {
+                                setS(() {});
+                                setState(() => n.bg = c);
+                                Store.I.save();
+                              },
+                              child: Container(
+                                width: 40,
+                                height: 40,
+                                decoration: BoxDecoration(
+                                  color: c == 0 ? Theme.of(context).colorScheme.surface : Color(c),
+                                  shape: BoxShape.circle,
+                                  border: Border.all(color: sel ? Theme.of(context).colorScheme.primary : Colors.grey, width: sel ? 3 : 1),
+                                ),
+                                child: c == 0 ? const Icon(Icons.block, size: 18) : null,
+                              ),
+                            );
+                          }).toList(),
+                        ),
+                        const SizedBox(height: 16),
+                        const Text('Kâğıt deseni', style: TextStyle(fontWeight: FontWeight.w700)),
+                        const SizedBox(height: 6),
+                        Wrap(
+                          spacing: 8,
+                          children: [
+                            for (final p in const [['none', 'Düz'], ['lined', 'Çizgili'], ['grid', 'Kareli'], ['dots', 'Noktalı']])
+                              ChoiceChip(
+                                label: Text(p[1]),
+                                selected: n.pattern == p[0],
+                                onSelected: (_) {
+                                  setS(() {});
+                                  setState(() => n.pattern = p[0]);
+                                  Store.I.save();
+                                },
+                              ),
+                          ],
+                        ),
+                      ]),
+                    ),
+                  );
+                }),
+              );
+            }
+
+            Future<void> _addTag() async {
+              final t = await textDialog(context, 'Etiket ekle', hint: 'ör. sınav');
+              if (t == null) return;
+              final c = t.trim().replaceAll('#', '');
+              if (c.isEmpty || n.tags.contains(c)) return;
+              setState(() => n.tags.add(c));
+              _changed();
+            }
+
+            Future<void> _menu(String v) async {
+              if (v == 'count') {
+                final w = RegExp(r'\S+').allMatches(tc.text).length;
+                toast(context, '$w kelime • ${fmtNum(tc.text.length)} harf • defter: ${fmtNum(widget.nb.chars)} / ${fmtNum(kMaxNotebookChars)}');
+              } else if (v == 'share') {
+                await Share.share('${n.title}\n\n${tc.text}');
+              } else if (v == 'export') {
+                final f = File('${Store.I.dir.path}/${n.title.isEmpty ? "not" : n.title.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), "_")}.txt');
+                await f.writeAsString('${n.title}\n\n${tc.text}');
+                await Share.shareXFiles([XFile(f.path)]);
+              } else if (v == 'tag') {
+                await _addTag();
+              } else if (v == 'bg') {
+                _bgSheet();
+              } else if (v == 'trash') {
+                Store.I.trash(n);
+                if (mounted) Navigator.pop(context);
+              }
+            }
+
+            void _attMenu(Attachment a) {
+              showModalBottomSheet(
+                context: context,
+                builder: (ctx) => SafeArea(
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    if (a.type != 'sticker')
+                      ListTile(
+                          leading: const Icon(Icons.open_in_new),
+                          title: const Text('Aç'),
+                          onTap: () {
+                            Navigator.pop(ctx);
+                            OpenFilex.open(a.path);
+                          }),
+                    if (a.type == 'file' && isTextFile(a.path))
+                      ListTile(
+                          leading: const Icon(Icons.text_snippet),
+                          title: const Text('İçeriği nota ekle'),
+                          onTap: () async {
+                            Navigator.pop(ctx);
+                            try {
+                              final s = await File(a.path).readAsString();
+                              _insert('\n${s.length > 200000 ? s.substring(0, 200000) : s}\n');
+                            } catch (_) {
+                              if (mounted) toast(context, 'Dosya metin olarak okunamadı');
+                            }
+                          }),
+                    ListTile(
+                        leading: const Icon(Icons.delete_outline),
+                        title: const Text('Notdan kaldır'),
+                        onTap: () {
+                          Navigator.pop(ctx);
+                          setState(() => n.atts.remove(a));
+                          _changed();
+                        }),
+                  ]),
+                ),
+              );
+            }
+
+            Widget _attView(Attachment a) {
+              if (a.type == 'image' || a.type == 'gif') {
+                return GestureDetector(
+                  onTap: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => Scaffold(
+                        backgroundColor: Colors.black,
+                        appBar: AppBar(backgroundColor: Colors.black, foregroundColor: Colors.white),
+                        body: Center(child: InteractiveViewer(maxScale: 6, child: Image.file(File(a.path)))),
+                      ),
+                    ),
+                  ),
+                  onLongPress: () => _attMenu(a),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(14),
+                    child: Image.file(File(a.path), width: 112, height: 112, fit: BoxFit.cover,
+                        errorBuilder: (_, __, ___) => Container(width: 112, height: 112, color: Colors.grey.withOpacity(0.3), child: const Icon(Icons.broken_image))),
+                  ),
+                );
+              }
+              if (a.type == 'sticker') {
+                return GestureDetector(onLongPress: () => _attMenu(a), child: Text(a.path, style: const TextStyle(fontSize: 56)));
+              }
+              if (a.type == 'audio') {
+                return AudioTile(att: a, onLong: () => _attMenu(a), onText: (t) => _insert('\n🎤 $t\n'));
+              }
+              final isPdf = a.path.toLowerCase().endsWith('.pdf');
+              return GestureDetector(
+                onTap: () => OpenFilex.open(a.path),
+                onLongPress: () => _attMenu(a),
+                child: Container(
+                  width: 170,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(color: Colors.grey.withOpacity(0.18), borderRadius: BorderRadius.circular(14)),
+                  child: Row(children: [
+                    Icon(isPdf ? Icons.picture_as_pdf : Icons.insert_drive_file, color: isPdf ? Colors.red : null),
+                    const SizedBox(width: 8),
+                    Expanded(child: Text(a.name.isEmpty ? a.path.split('/').last : a.name, maxLines: 2, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12))),
+                  ]),
+                ),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final cs = Theme.of(context).colorScheme;
+              final dark = Theme.of(context).brightness == Brightness.dark;
+              Color bgc = cs.surface;
+              if (n.bg != 0) bgc = dark ? Color.alphaBlend(Colors.black.withOpacity(0.6), Color(n.bg)) : Color(n.bg);
+              final lineColor = cs.onSurface.withOpacity(0.10);
+              final words = RegExp(r'\S+').allMatches(tc.text).length;
+              return Scaffold(
+                backgroundColor: bgc,
+                appBar: AppBar(
+                  backgroundColor: bgc,
+                  titleSpacing: 0,
+                  title: TextField(
+                    controller: titleC,
+                    onChanged: (_) => _changed(),
+                    style: const TextStyle(fontSize: 19, fontWeight: FontWeight.w700),
+                    decoration: const InputDecoration(hintText: 'Başlık', border: InputBorder.none),
+                  ),
+                  actions: [
+                    ValueListenableBuilder<UndoHistoryValue>(
+                      valueListenable: undo,
+                      builder: (_, v, __) => Row(mainAxisSize: MainAxisSize.min, children: [
+                        IconButton(icon: const Icon(Icons.undo), onPressed: v.canUndo ? undo.undo : null),
+                        IconButton(icon: const Icon(Icons.redo), onPressed: v.canRedo ? undo.redo : null),
+                      ]),
+                    ),
+                    IconButton(
+                      icon: Icon(n.pinned ? Icons.push_pin : Icons.push_pin_outlined),
+                      onPressed: () {
+                        setState(() => n.pinned = !n.pinned);
+                        Store.I.save();
+                      },
+                    ),
+                    IconButton(
+                      icon: const AiLogo(size: 28),
+                      onPressed: () => showAiPanel(context, note: n, notebook: widget.nb, onApplied: () {
+                        tc.text = n.text;
+                        setState(() {});
+                      }),
+                    ),
+                    PopupMenuButton<String>(
+                      onSelected: _menu,
+                      itemBuilder: (_) => const [
+                        PopupMenuItem(value: 'tag', child: Text('Etiket ekle')),
+                        PopupMenuItem(value: 'bg', child: Text('Arka plan ve kâğıt')),
+                        PopupMenuItem(value: 'count', child: Text('Kelime / harf sayısı')),
+                        PopupMenuItem(value: 'share', child: Text('Metni paylaş')),
+                        PopupMenuItem(value: 'export', child: Text('.txt dosyası olarak paylaş')),
+                        PopupMenuItem(value: 'trash', child: Text('Çöp kutusuna taşı')),
+                      ],
+                    ),
+                  ],
+                ),
+                body: Column(children: [
+                  Expanded(
+                    child: Stack(children: [
+                      Positioned.fill(child: CustomPaint(painter: PaperPainter(n.pattern, lineColor))),
+                      SingleChildScrollView(
+                        padding: const EdgeInsets.fromLTRB(16, 4, 16, 24),
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          if (n.tags.isNotEmpty)
+                            Wrap(
+                              spacing: 6,
+                              children: n.tags
+                                  .map((t) => InputChip(
+                                        label: Text('#$t', style: const TextStyle(fontSize: 12)),
+                                        onDeleted: () {
+                                          setState(() => n.tags.remove(t));
+                                          _changed();
+                                        },
+                                      ))
+                                  .toList(),
+                            ),
+                          TextField(
+                            controller: tc,
+                            focusNode: focus,
+                            undoController: undo,
+                            minLines: 10,
+                            maxLines: null,
+                            keyboardType: TextInputType.multiline,
+                            inputFormatters: [LimitFormatter(widget.nb)],
+                            onChanged: (_) {
+                              _changed();
+                              setState(() {});
+                            },
+                            style: TextStyle(fontSize: Store.I.fontSize, height: 1.75),
+                            decoration: const InputDecoration(hintText: 'Yazmaya başla…', border: InputBorder.none),
+                          ),
+                          if (n.strokes.isNotEmpty) ...[
+                            const SizedBox(height: 8),
+                            GestureDetector(
+                              onTap: () async {
+                                await Navigator.push(context, MaterialPageRoute(builder: (_) => DrawPage(note: n)));
+                                setState(() {});
+                              },
+                              onLongPress: () async {
+                                if (await confirmDialog(context, 'Çizimi sil?')) {
+                                  setState(() => n.strokes.clear());
+                                  _changed();
+                                }
+                              },
+                              child: ConstrainedBox(
+                                constraints: const BoxConstraints(maxWidth: 280),
+                                child: AspectRatio(
+                                  aspectRatio: 1,
+                                  child: Container(
+                                    decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(14), border: Border.all(color: Colors.black12)),
+                                    child: ClipRRect(borderRadius: BorderRadius.circular(14), child: CustomPaint(painter: StrokesPainter(n.strokes))),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                          if (n.atts.isNotEmpty) ...[
+                            const SizedBox(height: 12),
+                            Wrap(spacing: 10, runSpacing: 10, crossAxisAlignment: WrapCrossAlignment.center, children: n.atts.map(_attView).toList()),
+                          ],
+                          const SizedBox(height: 12),
+                          Text('$words kelime • ${fmtNum(tc.text.length)} harf', style: TextStyle(fontSize: 11, color: cs.onSurface.withOpacity(0.5))),
+                        ]),
+                      ),
+                    ]),
+                  ),
+                  Material(
+                    elevation: 8,
+                    color: cs.surface,
+                    child: SafeArea(
+                      top: false,
+                      child: SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: Row(children: [
+                          IconButton(tooltip: 'Yapılacaklar kutusu', icon: const Icon(Icons.check_box_outlined), onPressed: _checkbox),
+                          IconButton(tooltip: 'Emoji, simge, sticker', icon: const Icon(Icons.emoji_emotions_outlined), onPressed: _emojiSheet),
+                          IconButton(tooltip: 'Resim', icon: const Icon(Icons.image_outlined), onPressed: _pickImage),
+                          IconButton(tooltip: 'GIF', icon: const Icon(Icons.gif), onPressed: () => _pickFile(FileType.custom, ext: ['gif'])),
+                          IconButton(
+                              tooltip: 'Sesle yaz',
+                              icon: Icon(listening ? Icons.mic : Icons.mic_none, color: listening ? Colors.red : null),
+                              onPressed: _toggleMic),
+                          IconButton(tooltip: 'Ses dosyası', icon: const Icon(Icons.audiotrack_outlined), onPressed: () => _pickFile(FileType.audio)),
+                          IconButton(tooltip: 'PDF / dosya', icon: const Icon(Icons.attach_file), onPressed: () => _pickFile(FileType.any)),
+                          IconButton(
+                              tooltip: 'Çizim',
+                              icon: const Icon(Icons.brush_outlined),
+                              onPressed: () async {
+                                await Navigator.push(context, MaterialPageRoute(builder: (_) => DrawPage(note: n)));
+                                setState(() {});
+                              }),
+                          IconButton(tooltip: 'Arka plan', icon: const Icon(Icons.palette_outlined), onPressed: _bgSheet),
+                          IconButton(tooltip: 'Etiket', icon: const Icon(Icons.sell_outlined), onPressed: _addTag),
+                        ]),
+                      ),
+                    ),
+                  ),
+                ]),
+              );
+            }
+          }
+
+          class AudioTile extends StatefulWidget {
+            final Attachment att;
+            final VoidCallback onLong;
+            final void Function(String) onText;
+            const AudioTile({super.key, required this.att, required this.onLong, required this.onText});
+            @override
+            State<AudioTile> createState() => _AudioTileState();
+          }
+
+          class _AudioTileState extends State<AudioTile> {
+            final player = AudioPlayer();
+            bool playing = false;
+            bool busy = false;
+            StreamSubscription? sub;
+
+            @override
+            void initState() {
+              super.initState();
+              sub = player.onPlayerComplete.listen((_) {
+                if (mounted) setState(() => playing = false);
+              });
+            }
+
+            @override
+            void dispose() {
+              sub?.cancel();
+              player.dispose();
+              super.dispose();
+            }
+
+            Future<void> _toggle() async {
+              try {
+                if (playing) {
+                  await player.pause();
+                  setState(() => playing = false);
+                } else {
+                  await player.play(DeviceFileSource(widget.att.path));
+                  setState(() => playing = true);
+                }
+              } catch (e) {
+                if (mounted) toast(context, 'Ses oynatılamadı');
+              }
+            }
+
+            Future<void> _transcribe() async {
+              if (!Store.I.hasAi) {
+                toast(context, 'Önce yapay zekayı bağla (Groq veya OpenAI anahtarı)');
+                return;
+              }
+              setState(() => busy = true);
+              try {
+                final t = await transcribeAudio(widget.att.path);
+                if (mounted) widget.onText(t);
+              } catch (e) {
+                if (mounted) toast(context, e.toString().replaceFirst('Exception: ', ''));
+              }
+              if (mounted) setState(() => busy = false);
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return GestureDetector(
+                onLongPress: widget.onLong,
+                child: Container(
+                  width: 230,
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                  decoration: BoxDecoration(color: Colors.grey.withOpacity(0.18), borderRadius: BorderRadius.circular(30)),
+                  child: Row(children: [
+                    IconButton(icon: Icon(playing ? Icons.pause_circle : Icons.play_circle, size: 34), onPressed: _toggle),
+                    Expanded(child: Text(widget.att.name.isEmpty ? 'Ses' : widget.att.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12))),
+                    busy
+                        ? const Padding(padding: EdgeInsets.all(10), child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)))
+                        : IconButton(tooltip: 'Yazıya çevir', icon: const Icon(Icons.subtitles_outlined), onPressed: _transcribe),
+                  ]),
+                ),
+              );
+            }
+          }
+
+          class DrawPage extends StatefulWidget {
+            final Note note;
+            const DrawPage({super.key, required this.note});
+            @override
+            State<DrawPage> createState() => _DrawPageState();
+          }
+
+          class _DrawPageState extends State<DrawPage> {
+            int color = kPenColors.first;
+            double width = 4;
+            String tool = 'pen'; // pen | eraser | stamp
+            String stamp = '😀';
+            bool grid = false;
+            Stroke? cur;
+
+            List<Stroke> get strokes => widget.note.strokes;
+
+            void _commit() {
+              widget.note.updated = DateTime.now().millisecondsSinceEpoch;
+              Store.I.save();
+            }
+
+            Offset _norm(Offset p, double size) => Offset((p.dx / size).clamp(0.0, 1.0), (p.dy / size).clamp(0.0, 1.0));
+
+            @override
+            Widget build(BuildContext context) {
+              final cs = Theme.of(context).colorScheme;
+              return Scaffold(
+                appBar: AppBar(
+                  title: const Text('Çizim'),
+                  actions: [
+                    IconButton(icon: Icon(grid ? Icons.grid_on : Icons.grid_off), onPressed: () => setState(() => grid = !grid)),
+                    IconButton(
+                        icon: const Icon(Icons.undo),
+                        onPressed: strokes.isEmpty
+                            ? null
+                            : () {
+                                setState(() => strokes.removeLast());
+                                _commit();
+                              }),
+                    IconButton(
+                        icon: const Icon(Icons.delete_sweep_outlined),
+                        onPressed: strokes.isEmpty
+                            ? null
+                            : () async {
+                                if (await confirmDialog(context, 'Tüm çizim silinsin mi?')) {
+                                  setState(() => strokes.clear());
+                                  _commit();
+                                }
+                              }),
+                    IconButton(icon: const Icon(Icons.check), onPressed: () => Navigator.pop(context)),
+                  ],
+                ),
+                body: Column(children: [
+                  Expanded(
+                    child: Center(
+                      child: LayoutBuilder(builder: (ctx, c) {
+                        final size = c.maxWidth < c.maxHeight ? c.maxWidth : c.maxHeight;
+                        return Container(
+                          width: size,
+                          height: size,
+                          color: Colors.white,
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTapUp: (d) {
+                              if (tool != 'stamp') return;
+                              final p = _norm(d.localPosition, size);
+                              setState(() => strokes.add(Stroke(0, width < 4 ? 6 : width, [p.dx, p.dy], emoji: stamp)));
+                              _commit();
+                            },
+                            onPanStart: (d) {
+                              if (tool == 'stamp') return;
+                              final p = _norm(d.localPosition, size);
+                              setState(() {
+                                cur = Stroke(tool == 'eraser' ? 0xFFFFFFFF : color, tool == 'eraser' ? width * 3 : width, [p.dx, p.dy]);
+                                strokes.add(cur!);
+                              });
+                            },
+                            onPanUpdate: (d) {
+                              if (cur == null) return;
+                              final p = _norm(d.localPosition, size);
+                              setState(() => cur!.pts.addAll([p.dx, p.dy]));
+                            },
+                            onPanEnd: (_) {
+                              cur = null;
+                              _commit();
+                            },
+                            child: Stack(children: [
+                              if (grid) Positioned.fill(child: CustomPaint(painter: PaperPainter('grid', Colors.black12))),
+                              Positioned.fill(child: CustomPaint(painter: StrokesPainter(strokes))),
+                            ]),
+                          ),
+                        );
+                      }),
+                    ),
+                  ),
+                  Material(
+                    color: cs.surface,
+                    elevation: 8,
+                    child: SafeArea(
+                      top: false,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 6),
+                        child: Column(mainAxisSize: MainAxisSize.min, children: [
+                          Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                            ChoiceChip(label: const Text('✏️ Kalem'), selected: tool == 'pen', onSelected: (_) => setState(() => tool = 'pen')),
+                            const SizedBox(width: 6),
+                            ChoiceChip(label: const Text('🧽 Silgi'), selected: tool == 'eraser', onSelected: (_) => setState(() => tool = 'eraser')),
+                            const SizedBox(width: 6),
+                            ChoiceChip(label: Text('$stamp Damga'), selected: tool == 'stamp', onSelected: (_) => setState(() => tool = 'stamp')),
+                          ]),
+                          if (tool == 'stamp')
+                            SizedBox(
+                              height: 44,
+                              child: ListView(
+                                scrollDirection: Axis.horizontal,
+                                children: kStickers
+                                    .map((e) => InkWell(
+                                          onTap: () => setState(() => stamp = e),
+                                          child: Padding(padding: const EdgeInsets.symmetric(horizontal: 8), child: Center(child: Text(e, style: TextStyle(fontSize: e == stamp ? 30 : 24)))),
+                                        ))
+                                    .toList(),
+                              ),
+                            )
+                          else
+                            SizedBox(
+                              height: 44,
+                              child: ListView(
+                                scrollDirection: Axis.horizontal,
+                                padding: const EdgeInsets.symmetric(horizontal: 10),
+                                children: kPenColors
+                                    .map((c) => GestureDetector(
+                                          onTap: () => setState(() {
+                                            color = c;
+                                            tool = 'pen';
+                                          }),
+                                          child: Container(
+                                            width: 32,
+                                            height: 32,
+                                            margin: const EdgeInsets.all(6),
+                                            decoration: BoxDecoration(color: Color(c), shape: BoxShape.circle, border: Border.all(color: color == c ? cs.primary : Colors.grey, width: color == c ? 3 : 1)),
+                                          ),
+                                        ))
+                                    .toList(),
+                              ),
+                            ),
+                          Slider(min: 2, max: 24, value: width, onChanged: (v) => setState(() => width = v)),
+                        ]),
+                      ),
+                    ),
+                  ),
+                ]),
+              );
+            }
+          }
+          NOTLIOEOF
+
+      - name: lib/code.dart  (yazılımcı editörü)
+        working-directory: app
+        run: |
+          cat > lib/code.dart << 'NOTLIOEOF'
+          import 'dart:io';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:share_plus/share_plus.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+          import 'ai.dart';
+          import 'common.dart';
+          import 'editor.dart';
+          import 'models.dart';
+          import 'runner.dart';
+
+          const String _kw =
+              'if|else|elif|for|while|do|switch|case|break|continue|return|class|struct|enum|interface|function|def|fn|func|fun|var|let|const|val|int|long|short|float|double|char|bool|boolean|string|String|void|public|private|protected|static|final|new|this|self|import|from|include|using|package|namespace|try|catch|except|finally|throw|throws|raise|null|nil|None|true|false|True|False|and|or|not|in|is|async|await|lambda|yield|select|insert|into|values|create|table|update|delete|where|join|order|by|group|limit|print|echo|println|cout|printf|console|mut|impl|pub|use|mod|match|loop|go|defer|chan|range|override|abstract|extends|implements|typeof|readonly|object|when|init|SELECT|INSERT|INTO|VALUES|CREATE|TABLE|UPDATE|DELETE|WHERE|FROM';
+
+          final Map<String, RegExp> _reCache = {};
+
+          RegExp _regexFor(String lang) {
+            return _reCache.putIfAbsent(lang, () {
+              String cmt;
+              if (lang == 'python' || lang == 'yaml' || lang == 'php') {
+                cmt = r'#[^\n]*|//[^\n]*';
+              } else if (lang == 'sql') {
+                cmt = r'--[^\n]*';
+              } else {
+                cmt = r'//[^\n]*';
+              }
+              final pre = (lang == 'c' || lang == 'cpp' || lang == 'csharp') ? r'|#\w+' : '';
+              final src = '($cmt|/\\*[\\s\\S]*?\\*/|<!--[\\s\\S]*?-->)'
+                  '|("(?:\\\\.|[^"\\\\\\n])*"|\'(?:\\\\.|[^\'\\\\\\n])*\')'
+                  '|(\\b\\d+(?:\\.\\d+)?\\b)'
+                  '|(\\b(?:$_kw)\\b|</?[A-Za-z][\\w-]*$pre)';
+              return RegExp(src);
+            });
+          }
+
+          class CodeController extends TextEditingController {
+            String lang;
+            CodeController({String? text, required this.lang}) : super(text: text);
+
+            @override
+            TextSpan buildTextSpan({required BuildContext context, TextStyle? style, required bool withComposing}) {
+              final t = text;
+              final base = style ?? const TextStyle();
+              if (t.length > 150000) return TextSpan(style: base, text: t);
+              final dark = Theme.of(context).brightness == Brightness.dark;
+              final cCmt = dark ? const Color(0xFF7F8C8D) : const Color(0xFF8A8F98);
+              final cStr = dark ? const Color(0xFF9BE28B) : const Color(0xFF2E8B57);
+              final cNum = dark ? const Color(0xFFFFB86C) : const Color(0xFFD35400);
+              final cKw = dark ? const Color(0xFFBD93F9) : const Color(0xFF6C5CE7);
+              final spans = <TextSpan>[];
+              var last = 0;
+              for (final m in _regexFor(lang).allMatches(t)) {
+                if (m.start > last) spans.add(TextSpan(text: t.substring(last, m.start)));
+                Color col;
+                var bold = false;
+                if (m.group(1) != null) {
+                  col = cCmt;
+                } else if (m.group(2) != null) {
+                  col = cStr;
+                } else if (m.group(3) != null) {
+                  col = cNum;
+                } else {
+                  col = cKw;
+                  bold = true;
+                }
+                spans.add(TextSpan(text: m.group(0), style: TextStyle(color: col, fontWeight: bold ? FontWeight.w600 : FontWeight.normal)));
+                last = m.end;
+              }
+              if (last < t.length) spans.add(TextSpan(text: t.substring(last)));
+              return TextSpan(style: base, children: spans);
+            }
+          }
+
+          class IndentFormatter extends TextInputFormatter {
+            @override
+            TextEditingValue formatEditUpdate(TextEditingValue o, TextEditingValue n) {
+              if (n.text.length != o.text.length + 1) return n;
+              final pos = n.selection.baseOffset;
+              if (pos < 1 || pos > n.text.length || n.text[pos - 1] != '\n') return n;
+              final before = n.text.substring(0, pos - 1);
+              final ls = before.lastIndexOf('\n') + 1;
+              final line = before.substring(ls);
+              final ind = RegExp(r'^[ \t]*').firstMatch(line)!.group(0)!;
+              final tr = line.trimRight();
+              var extra = '';
+              if (tr.endsWith('{') || tr.endsWith(':') || tr.endsWith('(') || tr.endsWith('[')) extra = '    ';
+              final ins = ind + extra;
+              if (ins.isEmpty) return n;
+              final nt = n.text.substring(0, pos) + ins + n.text.substring(pos);
+              return TextEditingValue(text: nt, selection: TextSelection.collapsed(offset: pos + ins.length));
+            }
+          }
+
+          class HtmlPreview extends StatefulWidget {
+            final String html;
+            const HtmlPreview({super.key, required this.html});
+            @override
+            State<HtmlPreview> createState() => _HtmlPreviewState();
+          }
+
+          class _HtmlPreviewState extends State<HtmlPreview> {
+            late final WebViewController c;
+            @override
+            void initState() {
+              super.initState();
+              c = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setBackgroundColor(Colors.white)
+                ..loadHtmlString(widget.html);
+            }
+
+            @override
+            void didUpdateWidget(covariant HtmlPreview old) {
+              super.didUpdateWidget(old);
+              if (old.html != widget.html) c.loadHtmlString(widget.html);
+            }
+
+            @override
+            Widget build(BuildContext context) => WebViewWidget(controller: c);
+          }
+
+          class CodeEditorPage extends StatefulWidget {
+            final Note note;
+            final Notebook nb;
+            const CodeEditorPage({super.key, required this.note, required this.nb});
+            @override
+            State<CodeEditorPage> createState() => _CodeEditorPageState();
+          }
+
+          class _CodeEditorPageState extends State<CodeEditorPage> {
+            late final CodeController cc;
+            late final TextEditingController titleC;
+            final stdinC = TextEditingController();
+            final undo = UndoHistoryController();
+            RunResult? res;
+            bool running = false;
+            bool outOpen = false;
+            bool stdinOpen = false;
+
+            Note get n => widget.note;
+
+            static const TextStyle mono = TextStyle(fontFamily: 'monospace', fontSize: 14, height: 1.5);
+            static const StrutStyle strut = StrutStyle(fontFamily: 'monospace', fontSize: 14, height: 1.5, forceStrutHeight: true);
+
+            @override
+            void initState() {
+              super.initState();
+              cc = CodeController(text: n.text, lang: n.lang);
+              titleC = TextEditingController(text: n.title);
+            }
+
+            @override
+            void dispose() {
+              Store.I.save();
+              cc.dispose();
+              titleC.dispose();
+              stdinC.dispose();
+              super.dispose();
+            }
+
+            void _changed() {
+              n.text = cc.text;
+              n.title = titleC.text;
+              n.updated = DateTime.now().millisecondsSinceEpoch;
+              Store.I.save();
+            }
+
+            void _ins(String s, {int back = 0}) {
+              final t = cc.text;
+              final sel = cc.selection;
+              final start = sel.isValid ? sel.start : t.length;
+              final end = sel.isValid ? sel.end : t.length;
+              cc.value = TextEditingValue(text: t.replaceRange(start, end, s), selection: TextSelection.collapsed(offset: start + s.length - back));
+              _changed();
+              setState(() {});
+            }
+
+            Future<void> _run() async {
+              FocusScope.of(context).unfocus();
+              setState(() {
+                running = true;
+                outOpen = true;
+                res = null;
+              });
+              final r = await runCode(n.lang, cc.text, stdin: stdinC.text);
+              if (!mounted) return;
+              setState(() {
+                running = false;
+                res = r;
+              });
+            }
+
+            void _ai({String? initial}) {
+              showAiPanel(context, note: n, notebook: widget.nb, initial: initial, onApplied: () {
+                cc.text = n.text;
+                setState(() {});
+              });
+            }
+
+            Future<void> _askFeature() async {
+              final t = await textDialog(context, 'Ne eklensin?', hint: 'ör. kullanıcıdan sayı alsın');
+              if (t == null || t.trim().isEmpty) return;
+              _ai(initial: 'Bu koda şu özelliği ekle: ${t.trim()}\nKodun tamamını notlio-edit bloğu içinde ver.');
+            }
+
+            Future<void> _menu(String v) async {
+              if (v == 'copy') {
+                await Clipboard.setData(ClipboardData(text: cc.text));
+                if (mounted) toast(context, 'Kod kopyalandı');
+              } else if (v == 'share') {
+                final info = langOf(n.lang);
+                final base = n.title.isEmpty ? 'kod' : n.title.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
+                final f = File('${Store.I.dir.path}/$base.${info.ext}');
+                await f.writeAsString(cc.text);
+                await Share.shareXFiles([XFile(f.path)]);
+              } else if (v == 'lang') {
+                final pick = await showDialog<String>(
+                  context: context,
+                  builder: (ctx) => SimpleDialog(
+                    title: const Text('Dil seç'),
+                    children: kLangs.map((l) => SimpleDialogOption(onPressed: () => Navigator.pop(ctx, l.id), child: Text(l.name))).toList(),
+                  ),
+                );
+                if (pick != null) {
+                  setState(() {
+                    n.lang = pick;
+                    cc.lang = pick;
+                    res = null;
+                  });
+                  _changed();
+                }
+              } else if (v == 'trash') {
+                Store.I.trash(n);
+                if (mounted) Navigator.pop(context);
+              }
+            }
+
+            Widget _editor() {
+              final cs = Theme.of(context).colorScheme;
+              final text = cc.text;
+              final lines = '\n'.allMatches(text).length + 1;
+              var longest = 0;
+              for (final l in text.split('\n')) {
+                if (l.length > longest) longest = l.length;
+              }
+              final sw = MediaQuery.of(context).size.width;
+              final w = (longest * 8.6 + 48) > (sw - 56) ? (longest * 8.6 + 48) : (sw - 56);
+              return Container(
+                color: cs.surfaceContainerLow,
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.only(top: 8, bottom: 80),
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Container(
+                        width: 44,
+                        padding: const EdgeInsets.only(right: 8),
+                        child: Text(
+                          List.generate(lines, (i) => '${i + 1}').join('\n'),
+                          textAlign: TextAlign.right,
+                          strutStyle: strut,
+                          style: mono.copyWith(color: cs.onSurface.withOpacity(0.35)),
+                        ),
+                      ),
+                      SizedBox(
+                        width: w,
+                        child: TextField(
+                          controller: cc,
+                          undoController: undo,
+                          maxLines: null,
+                          keyboardType: TextInputType.multiline,
+                          autocorrect: false,
+                          enableSuggestions: false,
+                          smartDashesType: SmartDashesType.disabled,
+                          smartQuotesType: SmartQuotesType.disabled,
+                          inputFormatters: [LimitFormatter(widget.nb), IndentFormatter()],
+                          strutStyle: strut,
+                          style: mono.copyWith(color: cs.onSurface),
+                          decoration: const InputDecoration(isDense: true, contentPadding: EdgeInsets.zero, border: InputBorder.none, hintText: '// kodunu buraya yaz'),
+                          onChanged: (_) {
+                            _changed();
+                            setState(() {});
+                          },
+                        ),
+                      ),
+                    ]),
+                  ),
+                ),
+              );
+            }
+
+            Widget _output() {
+              final cs = Theme.of(context).colorScheme;
+              final info = langOf(n.lang);
+              final r = res;
+              return Container(
+                height: 280,
+                decoration: BoxDecoration(color: cs.surface, border: Border(top: BorderSide(color: cs.outlineVariant))),
+                child: Column(children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 4, 4, 0),
+                    child: Row(children: [
+                      const Text('Çıktı', style: TextStyle(fontWeight: FontWeight.w700)),
+                      const SizedBox(width: 8),
+                      if (running) const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
+                      const Spacer(),
+                      if (!info.local) IconButton(tooltip: 'Girdi (stdin)', icon: Icon(Icons.keyboard, color: stdinOpen ? cs.primary : null), onPressed: () => setState(() => stdinOpen = !stdinOpen)),
+                      IconButton(icon: const Icon(Icons.close), onPressed: () => setState(() => outOpen = false)),
+                    ]),
+                  ),
+                  if (stdinOpen && !info.local)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      child: TextField(controller: stdinC, maxLines: 2, minLines: 1, decoration: const InputDecoration(isDense: true, hintText: 'Programa verilecek girdi (stdin)', border: OutlineInputBorder())),
+                    ),
+                  Expanded(
+                    child: r == null
+                        ? Center(child: Text(running ? 'Çalışıyor…' : 'Henüz çalıştırılmadı'))
+                        : r.html != null
+                            ? HtmlPreview(html: r.html!)
+                            : ListView(padding: const EdgeInsets.all(12), children: [
+                                if (r.stdout.isNotEmpty) SelectableText(r.stdout, style: mono.copyWith(fontSize: 13)),
+                                if (r.stderr.isNotEmpty)
+                                  Container(
+                                    margin: const EdgeInsets.only(top: 8),
+                                    padding: const EdgeInsets.all(10),
+                                    decoration: BoxDecoration(color: Colors.red.withOpacity(0.12), borderRadius: BorderRadius.circular(10)),
+                                    child: SelectableText(r.stderr, style: mono.copyWith(fontSize: 13, color: Colors.red.shade400)),
+                                  ),
+                                if (r.stdout.isEmpty && r.stderr.isEmpty) const Text('(çıktı yok)'),
+                                const SizedBox(height: 8),
+                                Wrap(spacing: 8, children: [
+                                  if (r.stderr.isNotEmpty)
+                                    FilledButton.tonalIcon(
+                                      icon: const AiLogo(size: 18),
+                                      label: const Text('AI ile hatayı çöz'),
+                                      onPressed: () => _ai(
+                                          initial: 'Bu kodu çalıştırdım ve şu hatayı aldım:\n${r.stderr}\n\nHatanın nedenini kısaca açıkla ve düzeltilmiş kodun tamamını notlio-edit bloğu içinde ver.'),
+                                    ),
+                                  OutlinedButton.icon(icon: const Icon(Icons.add_circle_outline), label: const Text('AI: özellik ekle'), onPressed: _askFeature),
+                                ]),
+                              ]),
+                  ),
+                ]),
+              );
+            }
+
+            Widget _keys() {
+              final cs = Theme.of(context).colorScheme;
+              Widget k(String label, String s, {int back = 0}) => InkWell(
+                    onTap: () => _ins(s, back: back),
+                    child: Container(
+                      width: 38,
+                      height: 38,
+                      alignment: Alignment.center,
+                      child: Text(label, style: const TextStyle(fontFamily: 'monospace', fontSize: 16, fontWeight: FontWeight.w600)),
+                    ),
+                  );
+              return Material(
+                color: cs.surfaceContainer,
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(children: [
+                    InkWell(onTap: () => _ins('    '), child: Container(height: 38, padding: const EdgeInsets.symmetric(horizontal: 10), alignment: Alignment.center, child: const Text('TAB', style: TextStyle(fontWeight: FontWeight.w700)))),
+                    k('()', '()', back: 1),
+                    k('{}', '{}', back: 1),
+                    k('[]', '[]', back: 1),
+                    k('""', '""', back: 1),
+                    k("''", "''", back: 1),
+                    k(';', ';'),
+                    k(':', ':'),
+                    k('=', '='),
+                    k('<', '<'),
+                    k('>', '>'),
+                    k('/', '/'),
+                    k('#', '#'),
+                    k('!', '!'),
+                    k('&', '&'),
+                    k('|', '|'),
+                    k('+', '+'),
+                    k('-', '-'),
+                    k('*', '*'),
+                    k('_', '_'),
+                    k('\\', '\\'),
+                  ]),
+                ),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final info = langOf(n.lang);
+              return Scaffold(
+                appBar: AppBar(
+                  titleSpacing: 0,
+                  title: Row(children: [
+                    Expanded(
+                      child: TextField(
+                        controller: titleC,
+                        onChanged: (_) => _changed(),
+                        style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
+                        decoration: const InputDecoration(hintText: 'Başlık', border: InputBorder.none),
+                      ),
+                    ),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                      decoration: BoxDecoration(color: Theme.of(context).colorScheme.primary, borderRadius: BorderRadius.circular(10)),
+                      child: Text(info.name, style: TextStyle(color: Theme.of(context).colorScheme.onPrimary, fontSize: 11, fontWeight: FontWeight.w700)),
+                    ),
+                  ]),
+                  actions: [
+                    ValueListenableBuilder<UndoHistoryValue>(
+                      valueListenable: undo,
+                      builder: (_, v, __) => Row(mainAxisSize: MainAxisSize.min, children: [
+                        IconButton(icon: const Icon(Icons.undo), onPressed: v.canUndo ? undo.undo : null),
+                        IconButton(icon: const Icon(Icons.redo), onPressed: v.canRedo ? undo.redo : null),
+                      ]),
+                    ),
+                    IconButton(icon: const AiLogo(size: 28), onPressed: () => _ai()),
+                    PopupMenuButton<String>(
+                      onSelected: _menu,
+                      itemBuilder: (_) => const [
+                        PopupMenuItem(value: 'lang', child: Text('Dili değiştir')),
+                        PopupMenuItem(value: 'copy', child: Text('Kodu kopyala')),
+                        PopupMenuItem(value: 'share', child: Text('Dosya olarak paylaş')),
+                        PopupMenuItem(value: 'trash', child: Text('Çöp kutusuna taşı')),
+                      ],
+                    ),
+                  ],
+                ),
+                floatingActionButton: FloatingActionButton.extended(
+                  onPressed: running ? null : _run,
+                  backgroundColor: Colors.green.shade600,
+                  foregroundColor: Colors.white,
+                  icon: running ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white)) : const Icon(Icons.play_arrow),
+                  label: const Text('Çalıştır'),
+                ),
+                body: Column(children: [
+                  Expanded(child: _editor()),
+                  if (outOpen) _output(),
+                  _keys(),
+                ]),
+              );
+            }
+          }
+          NOTLIOEOF
+
+      - name: lib/ui.dart  (ekranlar)
+        working-directory: app
+        run: |
+          cat > lib/ui.dart << 'NOTLIOEOF'
+          import 'dart:io';
+          import 'package:file_picker/file_picker.dart';
+          import 'package:flutter/material.dart';
+          import 'package:share_plus/share_plus.dart';
+          import 'ai.dart';
+          import 'code.dart';
+          import 'common.dart';
+          import 'editor.dart';
+          import 'models.dart';
+          import 'runner.dart';
+
+          final Map<String, Notebook?> kCur = {};
+
+          Future<void> openNote(BuildContext context, Notebook nb, Note n) async {
+            await Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => n.isCode ? CodeEditorPage(note: n, nb: nb) : NoteEditorPage(note: n, nb: nb)),
+            );
+            if (n.title.trim().isEmpty && n.text.trim().isEmpty && n.atts.isEmpty && n.strokes.isEmpty && !n.trashed) {
+              nb.notes.removeWhere((x) => x.id == n.id);
+            }
+            Store.I.refresh();
+          }
+
+          class HomePage extends StatefulWidget {
+            const HomePage({super.key});
+            @override
+            State<HomePage> createState() => _HomePageState();
+          }
+
+          class _HomePageState extends State<HomePage> {
+            int tab = 0;
+
+            @override
+            Widget build(BuildContext context) {
+              final cs = Theme.of(context).colorScheme;
+              return Scaffold(
+                appBar: AppBar(
+                  title: Row(crossAxisAlignment: CrossAxisAlignment.end, children: [
+                    const Text('Notlio', style: TextStyle(fontSize: 24, fontWeight: FontWeight.w800)),
+                    const SizedBox(width: 8),
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 3),
+                      child: Text('Not×Land', style: TextStyle(fontSize: 12, color: cs.primary, fontWeight: FontWeight.w700)),
+                    ),
+                  ]),
+                  actions: [
+                    IconButton(
+                      tooltip: 'Notlio AI',
+                      icon: const AiLogo(size: 34),
+                      onPressed: () {
+                        Notebook? nb;
+                        if (tab == 0) nb = kCur['student'];
+                        if (tab == 1) nb = kCur['dev'];
+                        showAiPanel(context, notebook: nb);
+                      },
+                    ),
+                    const SizedBox(width: 6),
+                  ],
+                ),
+                body: IndexedStack(index: tab, children: const [
+                  NotesTab(kind: 'student'),
+                  NotesTab(kind: 'dev'),
+                  SearchTab(),
+                  SettingsTab(),
+                ]),
+                bottomNavigationBar: NavigationBar(
+                  selectedIndex: tab,
+                  onDestinationSelected: (i) => setState(() => tab = i),
+                  destinations: const [
+                    NavigationDestination(icon: Icon(Icons.school_outlined), selectedIcon: Icon(Icons.school), label: 'Öğrenci'),
+                    NavigationDestination(icon: Icon(Icons.code), selectedIcon: Icon(Icons.terminal), label: 'Yazılımcı'),
+                    NavigationDestination(icon: Icon(Icons.search), label: 'Ara'),
+                    NavigationDestination(icon: Icon(Icons.settings_outlined), selectedIcon: Icon(Icons.settings), label: 'Ayarlar'),
+                  ],
+                ),
+              );
+            }
+          }
+
+          class NotesTab extends StatefulWidget {
+            final String kind;
+            const NotesTab({super.key, required this.kind});
+            @override
+            State<NotesTab> createState() => _NotesTabState();
+          }
+
+          class _NotesTabState extends State<NotesTab> {
+            String? selId;
+            bool get dev => widget.kind == 'dev';
+
+            Future<String?> _pickLang() {
+              return showModalBottomSheet<String>(
+                context: context,
+                builder: (ctx) => SafeArea(
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      const Text('Hangi dilde?', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
+                      const SizedBox(height: 4),
+                      const Text('▶ ile çalışabilen diller', style: TextStyle(fontSize: 12)),
+                      const SizedBox(height: 12),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: kLangs
+                            .map((l) => ActionChip(
+                                  avatar: Icon(l.local ? Icons.phone_android : Icons.cloud_outlined, size: 16),
+                                  label: Text(l.name),
+                                  onPressed: () => Navigator.pop(ctx, l.id),
+                                ))
+                            .toList(),
+                      ),
+                    ]),
+                  ),
+                ),
+              );
+            }
+
+            Future<void> _newNote(Notebook? nb) async {
+              if (nb == null) {
+                toast(context, 'Önce bir defter oluştur');
+                return;
+              }
+              if (nb.chars >= kMaxNotebookChars) {
+                toast(context, 'Bu defter dolu (5.000.000 harf). Yeni defter aç.');
+                return;
+              }
+              Note note;
+              if (dev) {
+                final l = await _pickLang();
+                if (l == null) return;
+                note = Note(lang: l, text: langOf(l).starter);
+              } else {
+                note = Note();
+              }
+              nb.notes.add(note);
+              if (!mounted) return;
+              await openNote(context, nb, note);
+            }
+
+            Future<void> _newNb() async {
+              final name = await textDialog(context, 'Yeni defter', hint: dev ? 'ör. Python denemeleri' : 'ör. Matematik');
+              if (name == null || name.trim().isEmpty) return;
+              final nb = Notebook(name: name.trim(), kind: widget.kind, emoji: dev ? '💻' : '📒');
+              Store.I.notebooks.add(nb);
+              setState(() => selId = nb.id);
+              Store.I.refresh();
+            }
+
+            void _nbMenu(Notebook nb) {
+              showModalBottomSheet(
+                context: context,
+                builder: (ctx) => SafeArea(
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    ListTile(
+                      leading: const Icon(Icons.edit),
+                      title: const Text('Yeniden adlandır'),
+                      onTap: () async {
+                        Navigator.pop(ctx);
+                        final t = await textDialog(context, 'Defter adı', initial: nb.name);
+                        if (t != null && t.trim().isNotEmpty) {
+                          nb.name = t.trim();
+                          Store.I.refresh();
+                        }
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.emoji_emotions_outlined),
+                      title: const Text('Simgesini değiştir'),
+                      onTap: () async {
+                        Navigator.pop(ctx);
+                        final t = await textDialog(context, 'Bir emoji yaz', initial: nb.emoji);
+                        if (t != null && t.trim().isNotEmpty) {
+                          nb.emoji = t.trim().characters.first;
+                          Store.I.refresh();
+                        }
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.delete_outline, color: Colors.red),
+                      title: const Text('Defteri sil', style: TextStyle(color: Colors.red)),
+                      onTap: () async {
+                        Navigator.pop(ctx);
+                        final ok = await confirmDialog(context, '"${nb.name}" silinsin mi?', body: 'İçindeki ${nb.notes.length} not da silinir. Bu işlem geri alınamaz.', yes: 'Sil');
+                        if (ok) {
+                          Store.I.notebooks.removeWhere((x) => x.id == nb.id);
+                          Store.I.refresh();
+                        }
+                      },
+                    ),
+                  ]),
+                ),
+              );
+            }
+
+            void _noteMenu(Notebook nb, Note n) {
+              final others = Store.I.byKind(widget.kind).where((x) => x.id != nb.id).toList();
+              showModalBottomSheet(
+                context: context,
+                builder: (ctx) => SafeArea(
+                  child: Column(mainAxisSize: MainAxisSize.min, children: [
+                    ListTile(
+                      leading: Icon(n.pinned ? Icons.push_pin_outlined : Icons.push_pin),
+                      title: Text(n.pinned ? 'Sabitlemeyi kaldır' : 'Sabitle'),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        n.pinned = !n.pinned;
+                        Store.I.refresh();
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.copy),
+                      title: const Text('Kopyasını oluştur'),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        Store.I.duplicate(n, nb);
+                      },
+                    ),
+                    if (others.isNotEmpty)
+                      ListTile(
+                        leading: const Icon(Icons.drive_file_move_outline),
+                        title: const Text('Başka deftere taşı'),
+                        onTap: () async {
+                          Navigator.pop(ctx);
+                          final to = await showDialog<Notebook>(
+                            context: context,
+                            builder: (c) => SimpleDialog(
+                              title: const Text('Hangi deftere?'),
+                              children: others.map((o) => SimpleDialogOption(onPressed: () => Navigator.pop(c, o), child: Text('${o.emoji} ${o.name}'))).toList(),
+                            ),
+                          );
+                          if (to != null) Store.I.moveNote(n, to);
+                        },
+                      ),
+                    ListTile(
+                      leading: const Icon(Icons.delete_outline, color: Colors.red),
+                      title: const Text('Çöp kutusuna taşı', style: TextStyle(color: Colors.red)),
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        Store.I.trash(n);
+                        toast(context, 'Çöp kutusuna taşındı (30 gün saklanır)');
+                      },
+                    ),
+                  ]),
+                ),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return AnimatedBuilder(
+                animation: Store.I,
+                builder: (ctx, _) {
+                  final nbs = Store.I.byKind(widget.kind);
+                  Notebook? nb;
+                  if (nbs.isNotEmpty) nb = nbs.firstWhere((x) => x.id == selId, orElse: () => nbs.first);
+                  kCur[widget.kind] = nb;
+                  final notes = nb == null ? <Note>[] : Store.I.sortedNotes(nb);
+                  final cs = Theme.of(context).colorScheme;
+                  return Scaffold(
+                    floatingActionButton: FloatingActionButton(
+                      tooltip: dev ? 'Yeni kod' : 'Yeni not',
+                      onPressed: () => _newNote(nb),
+                      child: const Icon(Icons.add),
+                    ),
+                    body: Column(children: [
+                      SizedBox(
+                        height: 52,
+                        child: ListView(
+                          scrollDirection: Axis.horizontal,
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          children: [
+                            for (final b in nbs)
+                              Padding(
+                                padding: const EdgeInsets.only(right: 8, top: 6, bottom: 6),
+                                child: GestureDetector(
+                                  onLongPress: () => _nbMenu(b),
+                                  child: ChoiceChip(
+                                    label: Text('${b.emoji} ${b.name}'),
+                                    selected: nb != null && b.id == nb.id,
+                                    onSelected: (_) => setState(() => selId = b.id),
+                                  ),
+                                ),
+                              ),
+                            Padding(
+                              padding: const EdgeInsets.only(top: 6, bottom: 6),
+                              child: ActionChip(avatar: const Icon(Icons.add, size: 18), label: const Text('Defter'), onPressed: _newNb),
+                            ),
+                          ],
+                        ),
+                      ),
+                      if (nb != null)
+                        Padding(
+                          padding: const EdgeInsets.fromLTRB(16, 0, 16, 6),
+                          child: Column(children: [
+                            Row(children: [
+                              Text('${notes.length} not', style: TextStyle(fontSize: 11, color: cs.onSurface.withOpacity(0.6))),
+                              const Spacer(),
+                              Text('${fmtNum(nb.chars)} / ${fmtNum(kMaxNotebookChars)} harf', style: TextStyle(fontSize: 11, color: cs.onSurface.withOpacity(0.6))),
+                            ]),
+                            const SizedBox(height: 3),
+                            LinearProgressIndicator(value: (nb.chars / kMaxNotebookChars).clamp(0.0, 1.0), minHeight: 3, borderRadius: BorderRadius.circular(2)),
+                          ]),
+                        ),
+                      Expanded(
+                        child: nb == null
+                            ? Center(child: FilledButton.icon(onPressed: _newNb, icon: const Icon(Icons.add), label: const Text('İlk defterini oluştur')))
+                            : notes.isEmpty
+                                ? Center(
+                                    child: Padding(
+                                      padding: const EdgeInsets.all(32),
+                                      child: Column(mainAxisSize: MainAxisSize.min, children: [
+                                        Text(dev ? '💻' : '✍️', style: const TextStyle(fontSize: 54)),
+                                        const SizedBox(height: 10),
+                                        Text(dev ? 'Henüz kod yok.\nSağ alttaki + ile başla.' : 'Henüz not yok.\nSağ alttaki + ile ilk notunu yaz.', textAlign: TextAlign.center),
+                                      ]),
+                                    ),
+                                  )
+                                : dev
+                                    ? ListView.builder(
+                                        padding: const EdgeInsets.fromLTRB(12, 4, 12, 90),
+                                        itemCount: notes.length,
+                                        itemBuilder: (_, i) => NoteCard(note: notes[i], onTap: () => openNote(context, nb!, notes[i]), onLong: () => _noteMenu(nb!, notes[i])),
+                                      )
+                                    : GridView.builder(
+                                        padding: const EdgeInsets.fromLTRB(12, 4, 12, 90),
+                                        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 2, mainAxisSpacing: 10, crossAxisSpacing: 10, childAspectRatio: 0.92),
+                                        itemCount: notes.length,
+                                        itemBuilder: (_, i) => NoteCard(grid: true, note: notes[i], onTap: () => openNote(context, nb!, notes[i]), onLong: () => _noteMenu(nb!, notes[i])),
+                                      ),
+                      ),
+                    ]),
+                  );
+                },
+              );
+            }
+          }
+
+          class SearchTab extends StatefulWidget {
+            const SearchTab({super.key});
+            @override
+            State<SearchTab> createState() => _SearchTabState();
+          }
+
+          class _SearchTabState extends State<SearchTab> {
+            String q = '';
+            String kind = 'all';
+
+            String _snippet(String text, String ql) {
+              final i = text.toLowerCase().indexOf(ql);
+              if (i < 0) return text.length > 90 ? text.substring(0, 90) : text;
+              final s = i - 30 < 0 ? 0 : i - 30;
+              final e = i + ql.length + 60 > text.length ? text.length : i + ql.length + 60;
+              return (s > 0 ? '…' : '') + text.substring(s, e).replaceAll('\n', ' ') + (e < text.length ? '…' : '');
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return AnimatedBuilder(
+                animation: Store.I,
+                builder: (ctx, _) {
+                  final ql = q.trim().toLowerCase();
+                  var hits = Store.I.allHits().where((h) => kind == 'all' || h.notebook.kind == kind).toList();
+                  if (ql.isNotEmpty) {
+                    hits = hits
+                        .where((h) => h.note.title.toLowerCase().contains(ql) || h.note.text.toLowerCase().contains(ql) || h.note.tags.any((t) => t.toLowerCase().contains(ql)))
+                        .toList();
+                  }
+                  hits.sort((a, b) => b.note.updated.compareTo(a.note.updated));
+                  if (ql.isEmpty && hits.length > 15) hits = hits.sublist(0, 15);
+                  return Column(children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(14, 8, 14, 4),
+                      child: TextField(
+                        onChanged: (v) => setState(() => q = v),
+                        decoration: InputDecoration(
+                          hintText: 'Tüm defterlerde ara…',
+                          prefixIcon: const Icon(Icons.search),
+                          filled: true,
+                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(28), borderSide: BorderSide.none),
+                        ),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                      child: Row(children: [
+                        for (final k in const [['all', 'Hepsi'], ['student', 'Öğrenci'], ['dev', 'Yazılımcı']])
+                          Padding(
+                            padding: const EdgeInsets.only(right: 8),
+                            child: ChoiceChip(label: Text(k[1]), selected: kind == k[0], onSelected: (_) => setState(() => kind = k[0])),
+                          ),
+                      ]),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                      child: Align(alignment: Alignment.centerLeft, child: Text(ql.isEmpty ? 'Son notlar' : '${hits.length} sonuç', style: const TextStyle(fontSize: 12))),
+                    ),
+                    Expanded(
+                      child: hits.isEmpty
+                          ? const Center(child: Text('Sonuç yok'))
+                          : ListView.builder(
+                              itemCount: hits.length,
+                              itemBuilder: (_, i) {
+                                final h = hits[i];
+                                return ListTile(
+                                  leading: Text(h.notebook.emoji, style: const TextStyle(fontSize: 24)),
+                                  title: Text(h.note.title.isEmpty ? 'Başlıksız' : h.note.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                                  subtitle: Text('${h.notebook.name} • ${_snippet(h.note.text, ql)}', maxLines: 2, overflow: TextOverflow.ellipsis),
+                                  trailing: h.note.isCode ? Text(langOf(h.note.lang).name, style: const TextStyle(fontSize: 11)) : null,
+                                  onTap: () => openNote(context, h.notebook, h.note),
+                                );
+                              },
+                            ),
+                    ),
+                  ]);
+                },
+              );
+            }
+          }
+
+          class AiSetupPage extends StatelessWidget {
+            const AiSetupPage({super.key});
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: const Text('Yapay zeka')),
+                body: ListView(padding: const EdgeInsets.all(18), children: [AiSetup(onDone: () => Navigator.pop(context))]),
+              );
+            }
+          }
+
+          class TrashPage extends StatelessWidget {
+            const TrashPage({super.key});
+            @override
+            Widget build(BuildContext context) {
+              return AnimatedBuilder(
+                animation: Store.I,
+                builder: (ctx, _) {
+                  final hits = Store.I.allHits(trashed: true);
+                  hits.sort((a, b) => b.note.trashedAt.compareTo(a.note.trashedAt));
+                  return Scaffold(
+                    appBar: AppBar(title: const Text('Çöp kutusu'), actions: [
+                      if (hits.isNotEmpty)
+                        TextButton(
+                          onPressed: () async {
+                            if (await confirmDialog(context, 'Çöp kutusu boşaltılsın mı?', body: 'Bu işlem geri alınamaz.', yes: 'Boşalt')) {
+                              for (final h in hits) {
+                                Store.I.deleteForever(h.note);
+                              }
+                            }
+                          },
+                          child: const Text('Boşalt'),
+                        ),
+                    ]),
+                    body: hits.isEmpty
+                        ? const Center(child: Text('Çöp kutusu boş 🎉'))
+                        : ListView.builder(
+                            itemCount: hits.length,
+                            itemBuilder: (_, i) {
+                              final h = hits[i];
+                              return ListTile(
+                                title: Text(h.note.title.isEmpty ? 'Başlıksız' : h.note.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                                subtitle: Text('${h.notebook.name} • silindi: ${fmtDate(h.note.trashedAt)}'),
+                                trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                                  IconButton(tooltip: 'Geri al', icon: const Icon(Icons.restore), onPressed: () => Store.I.restore(h.note)),
+                                  IconButton(tooltip: 'Kalıcı sil', icon: const Icon(Icons.delete_forever, color: Colors.red), onPressed: () => Store.I.deleteForever(h.note)),
+                                ]),
+                              );
+                            },
+                          ),
+                  );
+                },
+              );
+            }
+          }
+
+          class SettingsTab extends StatelessWidget {
+            const SettingsTab({super.key});
+
+            Widget _sec(BuildContext context, String t) => Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 18, 16, 4),
+                  child: Text(t, style: TextStyle(fontSize: 12, fontWeight: FontWeight.w800, color: Theme.of(context).colorScheme.primary)),
+                );
+
+            Future<void> _setPass(BuildContext context) async {
+              final p1 = TextEditingController();
+              final p2 = TextEditingController();
+              var encrypt = true;
+              final ok = await showDialog<bool>(
+                context: context,
+                builder: (ctx) => StatefulBuilder(
+                  builder: (ctx, setS) => AlertDialog(
+                    title: const Text('Parola belirle'),
+                    content: Column(mainAxisSize: MainAxisSize.min, children: [
+                      TextField(controller: p1, obscureText: true, decoration: const InputDecoration(labelText: 'Parola')),
+                      TextField(controller: p2, obscureText: true, decoration: const InputDecoration(labelText: 'Parola (tekrar)')),
+                      CheckboxListTile(
+                        contentPadding: EdgeInsets.zero,
+                        value: encrypt,
+                        onChanged: (v) => setS(() => encrypt = v ?? true),
+                        title: const Text('Verileri AES ile şifrele', style: TextStyle(fontSize: 14)),
+                        subtitle: const Text('Parolayı unutursan notlar kurtarılamaz!', style: TextStyle(fontSize: 11)),
+                      ),
+                    ]),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Vazgeç')),
+                      FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Kaydet')),
+                    ],
+                  ),
+                ),
+              );
+              if (ok != true) return;
+              if (p1.text.length < 4 || p1.text != p2.text) {
+                if (context.mounted) toast(context, 'Parolalar uyuşmuyor ya da 4 karakterden kısa');
+                return;
+              }
+              await Store.I.setLock(p1.text, encrypt);
+              if (context.mounted) toast(context, 'Parola ayarlandı');
+            }
+
+            Future<void> _import(BuildContext context) async {
+              try {
+                final r = await FilePicker.platform.pickFiles(type: FileType.any);
+                if (r == null || r.files.isEmpty || r.files.first.path == null) return;
+                final raw = await File(r.files.first.path!).readAsString();
+                final n = Store.I.importJson(raw);
+                if (context.mounted) toast(context, '$n defter içe aktarıldı');
+              } catch (e) {
+                if (context.mounted) toast(context, 'İçe aktarılamadı: bu bir Notlio yedeği değil');
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return AnimatedBuilder(
+                animation: Store.I,
+                builder: (ctx, _) {
+                  final s = Store.I;
+                  final cs = Theme.of(context).colorScheme;
+                  return ListView(children: [
+                    _sec(context, 'GÖRÜNÜM'),
+                    SwitchListTile(
+                      secondary: const Icon(Icons.dark_mode_outlined),
+                      title: const Text('Koyu tema'),
+                      value: s.dark,
+                      onChanged: (v) {
+                        s.dark = v;
+                        s.refresh();
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.palette_outlined),
+                      title: const Text('Vurgu rengi'),
+                      subtitle: Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: Wrap(
+                          spacing: 10,
+                          children: kAccents
+                              .map((c) => GestureDetector(
+                                    onTap: () {
+                                      s.accent = c;
+                                      s.refresh();
+                                    },
+                                    child: Container(
+                                      width: 34,
+                                      height: 34,
+                                      decoration: BoxDecoration(color: Color(c), shape: BoxShape.circle, border: Border.all(color: s.accent == c ? cs.onSurface : Colors.transparent, width: 3)),
+                                    ),
+                                  ))
+                              .toList(),
+                        ),
+                      ),
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.text_fields),
+                      title: Text('Yazı boyutu (${s.fontSize.round()})'),
+                      subtitle: Slider(
+                        min: 13,
+                        max: 24,
+                        divisions: 11,
+                        value: s.fontSize,
+                        onChanged: (v) {
+                          s.fontSize = v;
+                          s.refresh();
+                        },
+                      ),
+                    ),
+                    _sec(context, 'YAPAY ZEKA'),
+                    if (s.hasAi) ...[
+                      ListTile(
+                        leading: const AiLogo(size: 30),
+                        title: Text('Bağlı: ${companyName(s.provider)}'),
+                        subtitle: Text('Model: ${s.model}'),
+                      ),
+                      ListTile(leading: const Icon(Icons.memory), title: const Text('Modeli değiştir'), onTap: () => changeModel(context)),
+                      ListTile(
+                        leading: const Icon(Icons.vpn_key_outlined),
+                        title: const Text('Anahtarı değiştir'),
+                        onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AiSetupPage())),
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.link_off),
+                        title: const Text('Bağlantıyı kaldır'),
+                        onTap: () async {
+                          if (await confirmDialog(context, 'Yapay zeka bağlantısı kaldırılsın mı?')) {
+                            s.apiKey = '';
+                            s.provider = '';
+                            s.model = '';
+                            s.models = [];
+                            s.refresh();
+                          }
+                        },
+                      ),
+                    ] else
+                      ListTile(
+                        leading: const AiLogo(size: 30),
+                        title: const Text('Yapay zekayı bağla'),
+                        subtitle: const Text('Her şirketin API anahtarı çalışır. İsteğe bağlı.'),
+                        onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const AiSetupPage())),
+                      ),
+                    _sec(context, 'KOD ÇALIŞTIRMA'),
+                    ListTile(
+                      leading: const Icon(Icons.cloud_outlined),
+                      title: const Text('Çalıştırma sunucusu'),
+                      subtitle: Text(s.pistonUrl, style: const TextStyle(fontSize: 12)),
+                      onTap: () async {
+                        final t = await textDialog(context, 'Piston uyumlu adres', initial: s.pistonUrl);
+                        if (t != null && t.trim().startsWith('http')) {
+                          s.pistonUrl = t.trim();
+                          s.refresh();
+                        }
+                      },
+                    ),
+                    _sec(context, 'GÜVENLİK'),
+                    if (!s.hasLock)
+                      ListTile(leading: const Icon(Icons.lock_outline), title: const Text('Parola belirle'), subtitle: const Text('Uygulama açılırken parola sorar'), onTap: () => _setPass(context))
+                    else ...[
+                      SwitchListTile(
+                        secondary: const Icon(Icons.enhanced_encryption_outlined),
+                        title: const Text('Verileri AES ile şifrele'),
+                        subtitle: const Text('Dosya telefonda şifreli saklanır'),
+                        value: s.encrypted,
+                        onChanged: (v) => s.setEncrypt(v),
+                      ),
+                      ListTile(
+                        leading: const Icon(Icons.lock_open),
+                        title: const Text('Parolayı kaldır'),
+                        onTap: () async {
+                          if (await confirmDialog(context, 'Parola kaldırılsın mı?', body: 'Veriler şifresiz saklanır.')) {
+                            await s.removeLock();
+                          }
+                        },
+                      ),
+                    ],
+                    _sec(context, 'VERİ'),
+                    ListTile(
+                      leading: const Icon(Icons.upload_file),
+                      title: const Text('Yedeği dışa aktar'),
+                      subtitle: const Text('Tüm defterler tek .json dosyası (API anahtarı hariç)'),
+                      onTap: () async {
+                        final f = await s.exportFile();
+                        await Share.shareXFiles([XFile(f.path)], text: 'Notlio yedeği');
+                      },
+                    ),
+                    ListTile(leading: const Icon(Icons.download), title: const Text('Yedekten içe aktar'), onTap: () => _import(context)),
+                    ListTile(
+                      leading: const Icon(Icons.delete_outline),
+                      title: const Text('Çöp kutusu'),
+                      subtitle: Text('${s.allHits(trashed: true).length} not • 30 gün sonra silinir'),
+                      onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const TrashPage())),
+                    ),
+                    _sec(context, 'HAKKINDA'),
+                    const ListTile(
+                      leading: Text('🗺️', style: TextStyle(fontSize: 26)),
+                      title: Text('Notlio 1.0 • Not×Land'),
+                      subtitle: Text('Hesap yok. Reklam yok. Takip yok. Notların sadece senin telefonunda.\nYapay zeka isteğe bağlı: kapalıyken hiçbir şey internete çıkmaz.'),
+                      isThreeLine: true,
+                    ),
+                    const SizedBox(height: 40),
+                  ]);
+                },
+              );
+            }
+          }
+
+          class LockPage extends StatefulWidget {
+            const LockPage({super.key});
+            @override
+            State<LockPage> createState() => _LockPageState();
+          }
+
+          class _LockPageState extends State<LockPage> {
+            final c = TextEditingController();
+            bool bad = false;
+            bool busy = false;
+
+            Future<void> _go() async {
+              setState(() {
+                busy = true;
+                bad = false;
+              });
+              final ok = await Store.I.unlock(c.text);
+              if (!mounted) return;
+              setState(() {
+                busy = false;
+                bad = !ok;
+              });
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                body: SafeArea(
+                  child: Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(32),
+                      child: Column(mainAxisSize: MainAxisSize.min, children: [
+                        const Text('🔒', style: TextStyle(fontSize: 56)),
+                        const SizedBox(height: 8),
+                        const Text('Notlio', style: TextStyle(fontSize: 28, fontWeight: FontWeight.w800)),
+                        const SizedBox(height: 24),
+                        TextField(
+                          controller: c,
+                          obscureText: true,
+                          autofocus: true,
+                          onSubmitted: (_) => _go(),
+                          decoration: InputDecoration(labelText: 'Parola', border: const OutlineInputBorder(), errorText: bad ? 'Parola yanlış' : null),
+                        ),
+                        const SizedBox(height: 14),
+                        FilledButton(onPressed: busy ? null : _go, child: busy ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)) : const Text('Aç')),
+                      ]),
+                    ),
+                  ),
+                ),
+              );
+            }
+          }
+          NOTLIOEOF
+
+      - name: lib/main.dart  (giriş)
+        working-directory: app
+        run: |
+          cat > lib/main.dart << 'NOTLIOEOF'
+          import 'package:flutter/material.dart';
+          import 'models.dart';
+          import 'ui.dart';
+
+          Future<void> main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            await Store.I.init();
+            runApp(const NotlioApp());
+          }
+
+          class NotlioApp extends StatelessWidget {
+            const NotlioApp({super.key});
+
+            ThemeData _theme(Brightness b) {
+              final cs = ColorScheme.fromSeed(seedColor: Color(Store.I.accent), brightness: b);
+              return ThemeData(
+                useMaterial3: true,
+                colorScheme: cs,
+                appBarTheme: AppBarTheme(centerTitle: false, backgroundColor: cs.surface, surfaceTintColor: Colors.transparent),
+                snackBarTheme: const SnackBarThemeData(behavior: SnackBarBehavior.floating),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return AnimatedBuilder(
+                animation: Store.I,
+                builder: (context, _) => MaterialApp(
+                  title: 'Notlio',
+                  debugShowCheckedModeBanner: false,
+                  theme: _theme(Brightness.light),
+                  darkTheme: _theme(Brightness.dark),
+                  themeMode: Store.I.dark ? ThemeMode.dark : ThemeMode.light,
+                  home: Store.I.locked ? const LockPage() : const HomePage(),
+                ),
+              );
+            }
+          }
+          NOTLIOEOF
+
+      - name: Bağımlılıkları indir
+        working-directory: app
+        run: flutter pub get
+
+      - name: Kod analizi (bilgi amaçlı)
+        working-directory: app
+        continue-on-error: true
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Release APK derle
+        working-directory: app
+        run: flutter build apk --release
+
+      - name: APK adını düzenle
+        run: |
+          mkdir -p out
+          cp app/build/app/outputs/flutter-apk/app-release.apk out/Notlio.apk
+          ls -lh out/Notlio.apk
+
+      - name: Artifact olarak yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Notlio-APK
+          path: out/Notlio.apk
+          retention-days: 30
+
+      - name: Releases bölümüne ekle
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: notlio-v1.${{ github.run_number }}
+          name: Notlio 1.${{ github.run_number }}
+          body: "Notlio APK. İndirip yükle (bilinmeyen kaynaklardan yüklemeye izin ver)."
+          files: out/Notlio.apk
